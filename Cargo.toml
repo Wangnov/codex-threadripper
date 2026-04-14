@@ -1,0 +1,39 @@
+[package]
+name = "codex-threadripper"
+version = "0.1.0"
+edition = "2024"
+authors = ["Wangnov"]
+description = "Human-first CLI that keeps Codex thread history aligned to one provider bucket."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/wangnov/codex-threadripper"
+homepage = "https://github.com/wangnov/codex-threadripper"
+documentation = "https://github.com/wangnov/codex-threadripper#readme"
+keywords = ["codex", "cli", "sqlite", "launchd"]
+categories = ["command-line-utilities"]
+
+[package.metadata.release]
+tag-name = "v{{version}}"
+tag-message = "Release {{version}}"
+pre-release-commit-message = "release: {{version}}"
+
+[package.metadata.wix]
+upgrade-guid = "FEF4DA9B-F44C-4321-BCC4-509C23FBEE5F"
+path-guid = "6CA57CE7-FA13-425E-846B-5C991C7D1D08"
+license = false
+eula = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+notify = "8.2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.15"
+toml = "0.8"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
