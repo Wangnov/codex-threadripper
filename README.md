@@ -121,13 +121,21 @@ Generated installers and package outputs include:
 
 - shell installer
 - PowerShell installer
-- npm package
 - Homebrew formula artifact
 - Windows MSI
 
-`cargo-dist` uploads the npm package tarball to the GitHub Release. A separate GitHub Actions workflow publishes that tarball to npm.
+GitHub Release keeps the native archives and installers. npm uses a matrix package layout:
 
-The first npm publish uses a short-lived granular access token with `Read and write` + `Bypass 2FA`. Later releases use npm trusted publishing from GitHub Actions.
+- `codex-threadripper`
+- `@wangnov/codex-threadripper-macos-arm64`
+- `@wangnov/codex-threadripper-macos-x64`
+- `@wangnov/codex-threadripper-linux-arm64`
+- `@wangnov/codex-threadripper-linux-x64`
+- `@wangnov/codex-threadripper-windows-x64`
+
+The root package stays human-friendly. The platform packages carry the native binaries.
+
+`.github/workflows/npm-publish.yml` downloads the release artifacts, assembles the npm matrix locally in CI, and publishes both the platform packages and the root package with npm trusted publishing.
 
 Whenever you change `dist-workspace.toml`, rerun:
 

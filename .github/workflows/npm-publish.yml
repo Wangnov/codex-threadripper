@@ -1,4 +1,4 @@
-name: Publish npm package
+name: Publish npm packages
 
 on:
   release:
@@ -10,18 +10,26 @@ permissions:
   id-token: write
 
 jobs:
-  publish-npm:
+  publish-npm-matrix:
     runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Download npm package artifact from release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download release artifacts
         run: |
-          mkdir -p dist
+          mkdir -p dist/release-assets
           gh release download "${{ github.event.release.tag_name }}" \
             --repo "${{ github.repository }}" \
-            --pattern "codex-threadripper-npm-package.tar.gz" \
-            --dir dist
+            --pattern "codex-threadripper-aarch64-apple-darwin.tar.xz" \
+            --pattern "codex-threadripper-aarch64-unknown-linux-gnu.tar.xz" \
+            --pattern "codex-threadripper-x86_64-apple-darwin.tar.xz" \
+            --pattern "codex-threadripper-x86_64-unknown-linux-gnu.tar.xz" \
+            --pattern "codex-threadripper-x86_64-pc-windows-msvc.zip" \
+            --dir dist/release-assets
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -29,6 +37,23 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      - name: Publish to npm
+      - name: Build npm package matrix
         run: |
-          npm publish dist/codex-threadripper-npm-package.tar.gz --access public
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          node scripts/build-npm-matrix.mjs \
+            --version "$VERSION" \
+            --release-tag "$TAG" \
+            --artifacts-dir dist/release-assets \
+            --output-dir dist/npm-packages
+
+      - name: Publish platform packages
+        run: |
+          jq -r '.platformPackages[].dir' dist/npm-packages/manifest.json | while read -r dir; do
+            npm publish "$dir" --access public --provenance
+          done
+
+      - name: Publish root package
+        run: |
+          ROOT_DIR="$(jq -r '.rootPackage.dir' dist/npm-packages/manifest.json)"
+          npm publish "$ROOT_DIR" --access public --provenance

@@ -1,0 +1,57 @@
+{
+  "rootPackageName": "codex-threadripper",
+  "rootPackageDescription": "Human-first CLI that keeps Codex thread history aligned to one provider bucket.",
+  "binaryName": "codex-threadripper",
+  "author": "Wangnov",
+  "license": "MIT",
+  "repositoryUrl": "https://github.com/wangnov/codex-threadripper",
+  "homepage": "https://github.com/wangnov/codex-threadripper",
+  "keywords": ["codex", "cli", "sqlite", "launchd"],
+  "platformPackages": [
+    {
+      "dirName": "macos-arm64",
+      "packageName": "@wangnov/codex-threadripper-macos-arm64",
+      "description": "codex-threadripper prebuilt binary for macOS arm64",
+      "artifactName": "codex-threadripper-aarch64-apple-darwin.tar.xz",
+      "os": ["darwin"],
+      "cpu": ["arm64"],
+      "binaryName": "codex-threadripper"
+    },
+    {
+      "dirName": "macos-x64",
+      "packageName": "@wangnov/codex-threadripper-macos-x64",
+      "description": "codex-threadripper prebuilt binary for macOS x64",
+      "artifactName": "codex-threadripper-x86_64-apple-darwin.tar.xz",
+      "os": ["darwin"],
+      "cpu": ["x64"],
+      "binaryName": "codex-threadripper"
+    },
+    {
+      "dirName": "linux-arm64",
+      "packageName": "@wangnov/codex-threadripper-linux-arm64",
+      "description": "codex-threadripper prebuilt binary for Linux arm64",
+      "artifactName": "codex-threadripper-aarch64-unknown-linux-gnu.tar.xz",
+      "os": ["linux"],
+      "cpu": ["arm64"],
+      "binaryName": "codex-threadripper"
+    },
+    {
+      "dirName": "linux-x64",
+      "packageName": "@wangnov/codex-threadripper-linux-x64",
+      "description": "codex-threadripper prebuilt binary for Linux x64",
+      "artifactName": "codex-threadripper-x86_64-unknown-linux-gnu.tar.xz",
+      "os": ["linux"],
+      "cpu": ["x64"],
+      "binaryName": "codex-threadripper"
+    },
+    {
+      "dirName": "windows-x64",
+      "packageName": "@wangnov/codex-threadripper-windows-x64",
+      "description": "codex-threadripper prebuilt binary for Windows x64",
+      "artifactName": "codex-threadripper-x86_64-pc-windows-msvc.zip",
+      "os": ["win32"],
+      "cpu": ["x64"],
+      "binaryName": "codex-threadripper.exe"
+    }
+  ]
+}
