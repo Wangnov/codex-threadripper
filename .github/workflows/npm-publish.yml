@@ -1,9 +1,17 @@
 name: Publish npm packages
 
 on:
-  release:
+  workflow_run:
+    workflows:
+      - Release
     types:
-      - published
+      - completed
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Git tag to publish from
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,6 +19,7 @@ permissions:
 
 jobs:
   publish-npm-matrix:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ github.token }}
@@ -21,8 +30,9 @@ jobs:
 
       - name: Download release artifacts
         run: |
+          TAG="${{ inputs.release_tag || github.event.workflow_run.head_branch }}"
           mkdir -p dist/release-assets
-          gh release download "${{ github.event.release.tag_name }}" \
+          gh release download "$TAG" \
             --repo "${{ github.repository }}" \
             --pattern "codex-threadripper-aarch64-apple-darwin.tar.xz" \
             --pattern "codex-threadripper-aarch64-unknown-linux-gnu.tar.xz" \
@@ -39,7 +49,7 @@ jobs:
 
       - name: Build npm package matrix
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ inputs.release_tag || github.event.workflow_run.head_branch }}"
           VERSION="${TAG#v}"
           node scripts/build-npm-matrix.mjs \
             --version "$VERSION" \
