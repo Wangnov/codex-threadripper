@@ -116,7 +116,6 @@ After the tag is pushed, GitHub Actions runs `cargo-dist` and builds release art
 - Linux x64
 - Linux ARM64
 - Windows x64
-- Windows ARM64
 
 Generated installers and package outputs include:
 
@@ -125,6 +124,10 @@ Generated installers and package outputs include:
 - npm package
 - Homebrew formula artifact
 - Windows MSI
+
+`cargo-dist` uploads the npm package tarball to the GitHub Release. A separate GitHub Actions workflow publishes that tarball to npm.
+
+The first npm publish uses a short-lived granular access token with `Read and write` + `Bypass 2FA`. Later releases use npm trusted publishing from GitHub Actions.
 
 Whenever you change `dist-workspace.toml`, rerun:
 
