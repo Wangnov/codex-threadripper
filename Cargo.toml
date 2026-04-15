@@ -6,9 +6,9 @@ authors = ["Wangnov"]
 description = "Human-first CLI that keeps Codex thread history aligned to one provider bucket."
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/wangnov/codex-threadripper"
-homepage = "https://github.com/wangnov/codex-threadripper"
-documentation = "https://github.com/wangnov/codex-threadripper#readme"
+repository = "https://github.com/Wangnov/codex-threadripper"
+homepage = "https://github.com/Wangnov/codex-threadripper"
+documentation = "https://github.com/Wangnov/codex-threadripper#readme"
 keywords = ["codex", "cli", "sqlite", "launchd"]
 categories = ["command-line-utilities"]
 

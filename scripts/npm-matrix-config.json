@@ -4,8 +4,8 @@
   "binaryName": "codex-threadripper",
   "author": "Wangnov",
   "license": "MIT",
-  "repositoryUrl": "https://github.com/wangnov/codex-threadripper",
-  "homepage": "https://github.com/wangnov/codex-threadripper",
+  "repositoryUrl": "https://github.com/Wangnov/codex-threadripper",
+  "homepage": "https://github.com/Wangnov/codex-threadripper",
   "keywords": ["codex", "cli", "sqlite", "launchd"],
   "platformPackages": [
     {
