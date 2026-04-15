@@ -15,7 +15,6 @@ use rusqlite::Connection;
 use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use serde::Deserialize;
-use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -31,7 +30,12 @@ use std::time::UNIX_EPOCH;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PROVIDER: &str = "openai";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
-const SERVICE_LABEL: &str = "dev.wangnov.codex-threadripper";
+
+mod service;
+
+use service::ServiceInstallSummary;
+use service::ServiceManager;
+use service::ServiceStatus as BackgroundServiceStatus;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Locale {
@@ -78,7 +82,8 @@ enum Command {
         poll_interval_ms: u64,
     },
     /// placeholder
-    PrintPlist {
+    #[command(name = "print-service-config", alias = "print-plist")]
+    PrintServiceConfig {
         #[arg(
             long,
             default_value_t = DEFAULT_POLL_INTERVAL_MS,
@@ -88,7 +93,8 @@ enum Command {
         poll_interval_ms: u64,
     },
     /// placeholder
-    InstallLaunchd {
+    #[command(name = "install-service", alias = "install-launchd")]
+    InstallService {
         #[arg(
             long,
             default_value_t = DEFAULT_POLL_INTERVAL_MS,
@@ -98,7 +104,8 @@ enum Command {
         poll_interval_ms: u64,
     },
     /// placeholder
-    UninstallLaunchd,
+    #[command(name = "uninstall-service", alias = "uninstall-launchd")]
+    UninstallService,
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,9 +131,7 @@ struct StatusSummary {
     total_rows: u64,
     mismatched_rows: u64,
     distribution: Vec<(String, u64)>,
-    launchd_plist_path: PathBuf,
-    launchd_installed: bool,
-    launchd_loaded: bool,
+    service_status: BackgroundServiceStatus,
 }
 
 fn main() -> Result<()> {
@@ -151,26 +156,26 @@ fn main() -> Result<()> {
                 Duration::from_millis(poll_interval_ms),
             )?;
         }
-        Command::PrintPlist { poll_interval_ms } => {
+        Command::PrintServiceConfig { poll_interval_ms } => {
             let exe_path = std::env::current_exe().context(current_exe_error(locale))?;
-            let plist = build_launchd_plist(
+            let config = service::render_service_config(
                 exe_path.as_path(),
                 &codex_home,
                 cli.provider.as_deref(),
                 Duration::from_millis(poll_interval_ms),
-            );
-            println!("{plist}");
+            )?;
+            println!("{config}");
         }
-        Command::InstallLaunchd { poll_interval_ms } => {
-            install_launchd(
+        Command::InstallService { poll_interval_ms } => {
+            install_service(
                 locale,
                 &codex_home,
                 cli.provider.as_deref(),
                 Duration::from_millis(poll_interval_ms),
             )?;
         }
-        Command::UninstallLaunchd => {
-            uninstall_launchd(locale, &codex_home)?;
+        Command::UninstallService => {
+            uninstall_service(locale, &codex_home)?;
         }
     }
 
@@ -252,7 +257,7 @@ fn localized_command(locale: Locale) -> clap::Command {
                     .value_name(milliseconds_value_name(locale))
             })
     });
-    command = command.mut_subcommand("print-plist", |sub| {
+    command = command.mut_subcommand("print-service-config", |sub| {
         sub.about(print_plist_about(locale))
             .version(APP_VERSION)
             .disable_help_flag(true)
@@ -265,7 +270,7 @@ fn localized_command(locale: Locale) -> clap::Command {
                     .value_name(milliseconds_value_name(locale))
             })
     });
-    command = command.mut_subcommand("install-launchd", |sub| {
+    command = command.mut_subcommand("install-service", |sub| {
         sub.about(install_launchd_about(locale))
             .version(APP_VERSION)
             .disable_help_flag(true)
@@ -278,7 +283,7 @@ fn localized_command(locale: Locale) -> clap::Command {
                     .value_name(milliseconds_value_name(locale))
             })
     });
-    command = command.mut_subcommand("uninstall-launchd", |sub| {
+    command = command.mut_subcommand("uninstall-service", |sub| {
         sub.about(uninstall_launchd_about(locale))
             .version(APP_VERSION)
             .disable_help_flag(true)
@@ -452,13 +457,7 @@ fn collect_status(codex_home: &Path, provider_override: Option<&str>) -> Result<
     };
     let (total_rows, mismatched_rows, distribution) =
         inspect_sqlite_distribution(&sqlite_path, provider.as_str())?;
-    let launchd_plist_path = launchd_plist_path()?;
-    let launchd_installed = launchd_plist_path.exists();
-    let launchd_loaded = if launchd_installed {
-        launchd_service_loaded()?
-    } else {
-        false
-    };
+    let service_status = service::current_service_status()?;
 
     Ok(StatusSummary {
         codex_home: codex_home.to_path_buf(),
@@ -468,9 +467,7 @@ fn collect_status(codex_home: &Path, provider_override: Option<&str>) -> Result<
         total_rows,
         mismatched_rows,
         distribution,
-        launchd_plist_path,
-        launchd_installed,
-        launchd_loaded,
+        service_status,
     })
 }
 
@@ -611,58 +608,35 @@ fn create_sqlite_backup(sqlite_path: &Path, backup_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install_launchd(
+fn install_service(
     locale: Locale,
     codex_home: &Path,
     provider_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<()> {
-    let plist_path = launchd_plist_path()?;
-    let launch_agents_dir = plist_path
-        .parent()
-        .with_context(|| format!("launchd plist path has no parent: {}", plist_path.display()))?;
-    std::fs::create_dir_all(launch_agents_dir)?;
-
     let exe_path = std::env::current_exe().context(current_exe_error(locale))?;
-    let plist = build_launchd_plist(
+    let summary = service::install_service(
         exe_path.as_path(),
         codex_home,
         provider_override,
         poll_interval,
-    );
-    std::fs::write(&plist_path, plist)
-        .with_context(|| format!("failed to write {}", plist_path.display()))?;
+    )?;
 
-    let domain = launchctl_domain()?;
-    let plist_path_str = plist_path.to_string_lossy().to_string();
-    let _ = run_launchctl(["bootout", domain.as_str(), plist_path_str.as_str()]);
-    run_launchctl(["bootstrap", domain.as_str(), plist_path_str.as_str()])?;
-    let service_target = launchctl_service_target()?;
-    run_launchctl(["kickstart", "-k", service_target.as_str()])?;
-
-    println!("{}", install_launchd_done(locale));
-    println!("{}", launchd_label_message(locale, SERVICE_LABEL));
-    println!("{}", launchd_plist_message(locale, &plist_path));
-    println!("{}", launchd_codex_home_message(locale, codex_home));
-    println!("{}", launchd_polling_message(locale, poll_interval));
+    print_install_service_summary(locale, codex_home, poll_interval, &summary);
     println!();
     println!("{}", next_steps_heading(locale));
-    for line in install_next_steps(locale, exe_path.as_path(), codex_home)? {
+    for line in install_next_steps(locale, exe_path.as_path(), codex_home, summary.manager)? {
         println!("{line}");
     }
     Ok(())
 }
 
-fn uninstall_launchd(locale: Locale, codex_home: &Path) -> Result<()> {
-    let plist_path = launchd_plist_path()?;
-    if plist_path.exists() {
-        let domain = launchctl_domain()?;
-        let plist_path_str = plist_path.to_string_lossy().to_string();
-        let _ = run_launchctl(["bootout", domain.as_str(), plist_path_str.as_str()]);
-        std::fs::remove_file(&plist_path)
-            .with_context(|| format!("failed to remove {}", plist_path.display()))?;
+fn uninstall_service(locale: Locale, codex_home: &Path) -> Result<()> {
+    let service_status = service::current_service_status()?;
+    if service_status.installed {
+        let config_path = service::uninstall_service()?;
         println!("{}", uninstall_launchd_done(locale));
-        println!("{}", launchd_plist_message(locale, &plist_path));
+        println!("{}", launchd_plist_message(locale, &config_path));
         println!();
         println!("{}", next_steps_heading(locale));
         println!(
@@ -673,163 +647,12 @@ fn uninstall_launchd(locale: Locale, codex_home: &Path) -> Result<()> {
             )
         );
     } else {
-        println!("{}", no_launchd_plist_message(locale, &plist_path));
+        println!(
+            "{}",
+            no_launchd_plist_message(locale, &service_status.config_path)
+        );
     }
     Ok(())
-}
-
-fn build_launchd_plist(
-    exe_path: &Path,
-    codex_home: &Path,
-    provider_override: Option<&str>,
-    poll_interval: Duration,
-) -> String {
-    let logs_dir = logs_dir().unwrap_or_else(|_| default_logs_dir());
-    let stdout_path = logs_dir.join("codex-threadripper.log");
-    let stderr_path = logs_dir.join("codex-threadripper.error.log");
-
-    let mut arguments = vec![
-        xml_escape(exe_path.to_string_lossy().as_ref()),
-        "--codex-home".to_string(),
-        xml_escape(codex_home.to_string_lossy().as_ref()),
-    ];
-    if let Some(provider) = provider_override {
-        arguments.push("--provider".to_string());
-        arguments.push(xml_escape(provider));
-    }
-    arguments.push("watch".to_string());
-    arguments.push("--poll-interval-ms".to_string());
-    arguments.push(poll_interval.as_millis().to_string());
-
-    let mut plist = String::new();
-    let _ = write!(
-        plist,
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{SERVICE_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-"#
-    );
-    for argument in arguments {
-        let _ = writeln!(plist, "    <string>{argument}</string>");
-    }
-    let _ = write!(
-        plist,
-        r#"  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>{}</string>
-  <key>StandardErrorPath</key>
-  <string>{}</string>
-</dict>
-</plist>
-"#,
-        xml_escape(stdout_path.to_string_lossy().as_ref()),
-        xml_escape(stderr_path.to_string_lossy().as_ref()),
-    );
-    plist
-}
-
-fn launchd_plist_path() -> Result<PathBuf> {
-    Ok(launch_agents_dir()?.join(format!("{SERVICE_LABEL}.plist")))
-}
-
-fn launch_agents_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join("Library/LaunchAgents"))
-}
-
-fn logs_dir() -> Result<PathBuf> {
-    Ok(home_dir()?.join("Library/Logs"))
-}
-
-fn default_logs_dir() -> PathBuf {
-    PathBuf::from("/tmp")
-}
-
-fn home_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = std::env::var_os("USERPROFILE") {
-        return Ok(PathBuf::from(path));
-    }
-    let home_drive = std::env::var_os("HOMEDRIVE");
-    let home_path = std::env::var_os("HOMEPATH");
-    match (home_drive, home_path) {
-        (Some(drive), Some(path)) => {
-            let mut joined = PathBuf::from(drive);
-            joined.push(path);
-            Ok(joined)
-        }
-        _ => anyhow::bail!("HOME is not set"),
-    }
-}
-
-fn launchctl_domain() -> Result<String> {
-    let uid = current_uid()?;
-    Ok(format!("gui/{uid}"))
-}
-
-fn launchctl_service_target() -> Result<String> {
-    Ok(format!("{}/{}", launchctl_domain()?, SERVICE_LABEL))
-}
-
-fn current_uid() -> Result<u32> {
-    let output = ProcessCommand::new("id").arg("-u").output()?;
-    if !output.status.success() {
-        anyhow::bail!("failed to read current uid with `id -u`");
-    }
-    let uid = String::from_utf8(output.stdout)?.trim().parse::<u32>()?;
-    Ok(uid)
-}
-
-fn launchd_service_loaded() -> Result<bool> {
-    let service_target = launchctl_service_target()?;
-    let output = ProcessCommand::new("launchctl")
-        .arg("print")
-        .arg(service_target)
-        .output()?;
-    Ok(output.status.success())
-}
-
-fn run_launchctl<I, S>(args: I) -> Result<()>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let args_vec = args
-        .into_iter()
-        .map(|value| value.as_ref().to_string())
-        .collect::<Vec<_>>();
-    let output = ProcessCommand::new("launchctl").args(&args_vec).output()?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    anyhow::bail!(
-        "launchctl {} failed\nstdout: {}\nstderr: {}",
-        args_vec.join(" "),
-        stdout.trim(),
-        stderr.trim()
-    );
-}
-
-fn xml_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 fn print_status(locale: Locale, summary: &StatusSummary) {
@@ -874,18 +697,23 @@ fn print_status(locale: Locale, summary: &StatusSummary) {
     println!("{}", status_background_service_heading(locale));
     println!(
         "  {}: {}",
+        status_service_manager_label(locale),
+        service::manager_name(summary.service_status.manager)
+    );
+    println!(
+        "  {}: {}",
         status_plist_path_label(locale),
-        summary.launchd_plist_path.display()
+        summary.service_status.config_path.display()
     );
     println!(
         "  {}: {}",
         status_installed_label(locale),
-        yes_no(locale, summary.launchd_installed)
+        yes_no(locale, summary.service_status.installed)
     );
     println!(
         "  {}: {}",
         status_loaded_label(locale),
-        yes_no(locale, summary.launchd_loaded)
+        yes_no(locale, summary.service_status.running)
     );
 }
 
@@ -935,10 +763,10 @@ fn root_about(locale: Locale) -> &'static str {
 fn root_long_about(locale: Locale) -> &'static str {
     match locale {
         Locale::En => {
-            "codex-threadripper is a human-first maintenance tool for Codex thread history.\n\nIt reads the active provider from CODEX_HOME/config.toml and rewrites CODEX_HOME/state_5.sqlite so every thread stays in the same provider bucket. That makes thread lists and resume flows stop fragmenting across providers.\n\nExamples:\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-launchd"
+            "codex-threadripper is a human-first maintenance tool for Codex thread history.\n\nIt reads the active provider from CODEX_HOME/config.toml and rewrites CODEX_HOME/state_5.sqlite so every thread stays in the same provider bucket. That makes thread lists and resume flows stop fragmenting across providers.\n\nExamples:\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
         }
         Locale::ZhHans => {
-            "codex-threadripper 是一个面向人的 Codex 线程历史维护工具。\n\n它会读取 CODEX_HOME/config.toml 里的当前 provider，并改写 CODEX_HOME/state_5.sqlite，让所有线程始终落在同一个 provider 桶里。这样线程列表和 resume 流程就不会再被 provider 切碎。\n\n示例：\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-launchd"
+            "codex-threadripper 是一个面向人的 Codex 线程历史维护工具。\n\n它会读取 CODEX_HOME/config.toml 里的当前 provider，并改写 CODEX_HOME/state_5.sqlite，让所有线程始终落在同一个 provider 桶里。这样线程列表和 resume 流程就不会再被 provider 切碎。\n\n示例：\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
         }
     }
 }
@@ -1016,9 +844,9 @@ fn version_option_help(locale: Locale) -> &'static str {
 fn status_about(locale: Locale) -> &'static str {
     match locale {
         Locale::En => {
-            "Show the current config provider, SQLite distribution, and launchd service state."
+            "Show the current config provider, SQLite distribution, and background service state."
         }
-        Locale::ZhHans => "显示当前 config provider、SQLite 分布和 launchd 服务状态。",
+        Locale::ZhHans => "显示当前 config provider、SQLite 分布和后台服务状态。",
     }
 }
 
@@ -1045,22 +873,22 @@ fn poll_interval_help(locale: Locale) -> &'static str {
 
 fn print_plist_about(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Print the launchd plist that would run this tool in the background.",
-        Locale::ZhHans => "打印后台运行这个工具所需的 launchd plist。",
+        Locale::En => "Print the platform-specific background service config for this tool.",
+        Locale::ZhHans => "打印这个工具在当前平台上的后台服务配置。",
     }
 }
 
 fn install_launchd_about(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Install and load a launchd service for background watching.",
-        Locale::ZhHans => "安装并加载一个用于后台 watch 的 launchd 服务。",
+        Locale::En => "Install and start the platform-specific background service.",
+        Locale::ZhHans => "安装并启动当前平台上的后台服务。",
     }
 }
 
 fn uninstall_launchd_about(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Unload and remove the launchd service.",
-        Locale::ZhHans => "卸载并移除 launchd 服务。",
+        Locale::En => "Stop and remove the platform-specific background service.",
+        Locale::ZhHans => "停止并移除当前平台上的后台服务。",
     }
 }
 
@@ -1144,15 +972,15 @@ fn watch_stopped_message(locale: Locale) -> &'static str {
 
 fn install_launchd_done(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Installed launchd service.",
-        Locale::ZhHans => "已安装 launchd 服务。",
+        Locale::En => "Installed background service.",
+        Locale::ZhHans => "已安装后台服务。",
     }
 }
 
 fn uninstall_launchd_done(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Removed launchd service.",
-        Locale::ZhHans => "已移除 launchd 服务。",
+        Locale::En => "Removed background service.",
+        Locale::ZhHans => "已移除后台服务。",
     }
 }
 
@@ -1165,8 +993,8 @@ fn launchd_label_message(locale: Locale, label: &str) -> String {
 
 fn launchd_plist_message(locale: Locale, path: &Path) -> String {
     match locale {
-        Locale::En => format!("Plist path: {}", path.display()),
-        Locale::ZhHans => format!("Plist 路径：{}", path.display()),
+        Locale::En => format!("Config path: {}", path.display()),
+        Locale::ZhHans => format!("配置路径：{}", path.display()),
     }
 }
 
@@ -1191,18 +1019,42 @@ fn next_steps_heading(locale: Locale) -> &'static str {
     }
 }
 
-fn install_next_steps(locale: Locale, exe_path: &Path, codex_home: &Path) -> Result<Vec<String>> {
-    let status_command = cli_status_command(exe_path, codex_home);
-    let service_target = launchctl_service_target()?;
-    let log_path = logs_dir()
-        .unwrap_or_else(|_| default_logs_dir())
-        .join("codex-threadripper.log");
+fn print_install_service_summary(
+    locale: Locale,
+    codex_home: &Path,
+    poll_interval: Duration,
+    summary: &ServiceInstallSummary,
+) {
+    println!("{}", install_launchd_done(locale));
+    println!(
+        "{}: {}",
+        status_service_manager_label(locale),
+        service::manager_name(summary.manager)
+    );
+    println!("{}", launchd_label_message(locale, service::SERVICE_LABEL));
+    println!("{}", launchd_plist_message(locale, &summary.config_path));
+    println!("{}", launchd_codex_home_message(locale, codex_home));
+    println!("{}", launchd_polling_message(locale, poll_interval));
+    println!("{}", service_log_message(locale, &summary.log_path));
+}
 
-    Ok(vec![
-        run_status_next_step(locale, &status_command),
-        inspect_service_next_step(locale, &format!("launchctl print {service_target}")),
-        tail_log_next_step(locale, &format!("tail -f {}", log_path.display())),
-    ])
+fn install_next_steps(
+    locale: Locale,
+    exe_path: &Path,
+    codex_home: &Path,
+    manager: ServiceManager,
+) -> Result<Vec<String>> {
+    let status_command = cli_status_command(exe_path, codex_home);
+    let log_path = service::log_path()?;
+    let mut steps = vec![run_status_next_step(locale, &status_command)];
+    if let Some(command) = service::current_service_inspect_command()? {
+        steps.push(inspect_service_next_step(locale, manager, &command));
+    }
+    steps.push(tail_log_next_step(
+        locale,
+        &tail_log_command(manager, &log_path),
+    ));
+    Ok(steps)
 }
 
 fn cli_status_command(exe_path: impl AsRef<Path>, codex_home: &Path) -> String {
@@ -1230,10 +1082,21 @@ fn run_status_next_step(locale: Locale, command: &str) -> String {
     }
 }
 
-fn inspect_service_next_step(locale: Locale, command: &str) -> String {
+fn inspect_service_next_step(locale: Locale, manager: ServiceManager, command: &str) -> String {
+    let manager_name = service::manager_name(manager);
     match locale {
-        Locale::En => format!("Run this to inspect the launchd service: {command}"),
-        Locale::ZhHans => format!("运行这条命令查看 launchd 服务：{command}"),
+        Locale::En => format!("Run this to inspect the {manager_name} service: {command}"),
+        Locale::ZhHans => format!("运行这条命令查看 {manager_name} 服务：{command}"),
+    }
+}
+
+fn tail_log_command(manager: ServiceManager, log_path: &Path) -> String {
+    match manager {
+        ServiceManager::WindowsStartup => format!(
+            "powershell -NoProfile -Command \"Get-Content -Path '{}' -Wait\"",
+            log_path.display()
+        ),
+        _ => format!("tail -f {}", log_path.display()),
     }
 }
 
@@ -1246,8 +1109,11 @@ fn tail_log_next_step(locale: Locale, command: &str) -> String {
 
 fn no_launchd_plist_message(locale: Locale, path: &Path) -> String {
     match locale {
-        Locale::En => format!("No launchd plist is installed at {}.", path.display()),
-        Locale::ZhHans => format!("{} 这里还没有安装 launchd plist。", path.display()),
+        Locale::En => format!(
+            "No background service config is installed at {}.",
+            path.display()
+        ),
+        Locale::ZhHans => format!("{} 这里还没有安装后台服务配置。", path.display()),
     }
 }
 
@@ -1314,10 +1180,17 @@ fn status_background_service_heading(locale: Locale) -> &'static str {
     }
 }
 
+fn status_service_manager_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Manager",
+        Locale::ZhHans => "管理器",
+    }
+}
+
 fn status_plist_path_label(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Plist path",
-        Locale::ZhHans => "Plist 路径",
+        Locale::En => "Config path",
+        Locale::ZhHans => "配置路径",
     }
 }
 
@@ -1330,8 +1203,8 @@ fn status_installed_label(locale: Locale) -> &'static str {
 
 fn status_loaded_label(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Loaded",
-        Locale::ZhHans => "已加载",
+        Locale::En => "Running",
+        Locale::ZhHans => "运行中",
     }
 }
 
@@ -1356,6 +1229,13 @@ fn sync_backup_label(locale: Locale) -> &'static str {
     }
 }
 
+fn service_log_message(locale: Locale, path: &Path) -> String {
+    match locale {
+        Locale::En => format!("Log path: {}", path.display()),
+        Locale::ZhHans => format!("日志路径：{}", path.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::APP_VERSION;
@@ -1363,7 +1243,6 @@ mod tests {
     use super::Command;
     use super::DEFAULT_POLL_INTERVAL_MS;
     use super::Locale;
-    use super::build_launchd_plist;
     use super::detect_locale_from_sources;
     use super::install_next_steps;
     use super::localized_command;
@@ -1372,6 +1251,7 @@ mod tests {
     use super::read_provider_from_config;
     use super::reconcile_sqlite_in_place;
     use super::reconcile_sqlite_with_backup;
+    use crate::service::ServiceManager;
     use anyhow::Result;
     use clap::FromArgMatches;
     use clap::error::ErrorKind;
@@ -1415,7 +1295,7 @@ mod tests {
         assert!(rendered.contains("用法："));
         assert!(rendered.contains("命令:"));
         assert!(rendered.contains("选项:"));
-        assert!(rendered.contains("安装并加载一个用于后台 watch 的 launchd 服务"));
+        assert!(rendered.contains("安装并启动当前平台上的后台服务"));
         assert!(rendered.contains("强制指定 provider，跳过从 config.toml 读取 model_provider"));
         assert!(rendered.contains("显示帮助信息"));
         assert!(rendered.contains("显示版本号"));
@@ -1428,7 +1308,7 @@ mod tests {
         assert!(rendered.contains("Usage:"));
         assert!(rendered.contains("Commands:"));
         assert!(rendered.contains("Options:"));
-        assert!(rendered.contains("Install and load a launchd service for background watching"));
+        assert!(rendered.contains("Install and start the platform-specific background service"));
         assert!(
             rendered
                 .contains("Force a provider instead of reading model_provider from config.toml")
@@ -1442,12 +1322,12 @@ mod tests {
         let command = localized_command(Locale::En);
         let help_error = command
             .clone()
-            .try_get_matches_from(["codex-threadripper", "install-launchd", "--help"])
+            .try_get_matches_from(["codex-threadripper", "install-service", "--help"])
             .unwrap_err();
         assert_eq!(help_error.kind(), ErrorKind::DisplayHelp);
 
         let version_error = command
-            .try_get_matches_from(["codex-threadripper", "install-launchd", "--version"])
+            .try_get_matches_from(["codex-threadripper", "install-service", "--version"])
             .unwrap_err();
         assert_eq!(version_error.kind(), ErrorKind::DisplayVersion);
         assert!(version_error.to_string().contains(APP_VERSION));
@@ -1536,7 +1416,7 @@ mod tests {
 
     #[test]
     fn generates_launchd_plist() {
-        let plist = build_launchd_plist(
+        let plist = crate::service::build_launchd_plist(
             PathBuf::from("/tmp/codex-threadripper").as_path(),
             PathBuf::from("/tmp/codex-home").as_path(),
             Some("openai"),
@@ -1554,6 +1434,7 @@ mod tests {
             Locale::ZhHans,
             PathBuf::from("/tmp/codex threadripper").as_path(),
             PathBuf::from("/tmp/codex home").as_path(),
+            ServiceManager::Launchd,
         )?;
         assert_eq!(steps.len(), 3);
         assert!(steps[0].contains("运行这条命令查看状态"));

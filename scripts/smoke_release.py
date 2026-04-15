@@ -4,7 +4,6 @@ import argparse
 import os
 import pathlib
 import shutil
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -71,7 +70,19 @@ def main() -> int:
         backup_path = run_sync(binary_path, codex_home)
         assert_backup_contains_dirty_rows(backup_path)
         assert_status(binary_path, codex_home, expected_total=3, expected_mismatched=0)
-        run_watch(binary_path, codex_home, args.platform)
+        run_service_install(binary_path, codex_home)
+        try:
+            wait_for_service_status(
+                binary_path, codex_home, expected_installed="yes", expected_running="yes"
+            )
+            insert_dirty_row(codex_home / "state_5.sqlite")
+            write_new_session(codex_home)
+            wait_for_reconcile(binary_path, codex_home)
+        finally:
+            run_service_uninstall(binary_path, codex_home)
+            wait_for_service_status(
+                binary_path, codex_home, expected_installed="no", expected_running="no"
+            )
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -194,46 +205,37 @@ def assert_backup_contains_dirty_rows(backup_path: pathlib.Path) -> None:
         raise RuntimeError(f"backup expected 2 dirty rows, got {mismatched}")
 
 
-def run_watch(binary_path: pathlib.Path, codex_home: pathlib.Path, platform: str) -> None:
-    env = command_env()
-    creationflags = 0
-    if platform == "windows":
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-
-    process = subprocess.Popen(
-        [str(binary_path), "--codex-home", str(codex_home), "watch"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        creationflags=creationflags,
-    )
-
-    try:
-        wait_for_watch_banner(process, platform)
-        insert_dirty_row(codex_home / "state_5.sqlite")
-        write_new_session(codex_home)
-        wait_for_reconcile(binary_path, codex_home)
-    finally:
-        stop_watch_process(process, platform)
+def run_service_install(binary_path: pathlib.Path, codex_home: pathlib.Path) -> None:
+    output = run_command(binary_path, codex_home, "install-service")
+    if "Installed background service." not in output:
+        raise RuntimeError(f"unexpected install-service output\n\n{output}")
 
 
-def wait_for_watch_banner(process: subprocess.Popen[str], platform: str) -> None:
-    deadline = time.time() + 10
-    collected: list[str] = []
+def run_service_uninstall(binary_path: pathlib.Path, codex_home: pathlib.Path) -> None:
+    output = run_command(binary_path, codex_home, "uninstall-service")
+    if "Removed background service." not in output:
+        raise RuntimeError(f"unexpected uninstall-service output\n\n{output}")
+
+
+def wait_for_service_status(
+    binary_path: pathlib.Path,
+    codex_home: pathlib.Path,
+    *,
+    expected_installed: str,
+    expected_running: str,
+) -> None:
+    deadline = time.time() + 15
     while time.time() < deadline:
-        line = process.stdout.readline()
-        if line:
-            collected.append(line)
-            joined = "".join(collected)
-            if "Watch started" in joined and "500 ms poll interval" in joined:
-                return
-        if process.poll() is not None:
-            stderr = process.stderr.read() if process.stderr else ""
-            raise RuntimeError(
-                f"watch process exited early\nstdout:\n{''.join(collected)}\nstderr:\n{stderr}"
-            )
-    raise RuntimeError(f"watch banner timeout\nstdout:\n{''.join(collected)}")
+        output = run_command(binary_path, codex_home, "status")
+        installed_line = f"  Installed: {expected_installed}"
+        running_line = f"  Running: {expected_running}"
+        if installed_line in output and running_line in output:
+            return
+        time.sleep(0.25)
+    raise RuntimeError(
+        "service state did not converge in time\n\n"
+        f"expected Installed={expected_installed}, Running={expected_running}"
+    )
 
 
 def insert_dirty_row(sqlite_path: pathlib.Path) -> None:
