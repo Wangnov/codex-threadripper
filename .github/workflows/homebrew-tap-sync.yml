@@ -1,0 +1,67 @@
+name: Sync Homebrew tap
+
+on:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+jobs:
+  sync-homebrew-tap:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAP_REPO: Wangnov/homebrew-tap
+      FORMULA_NAME: codex-threadripper.rb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Wait for formula artifact
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist/homebrew
+
+          for attempt in $(seq 1 30); do
+            if gh release download "$TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern "$FORMULA_NAME" \
+              --dir dist/homebrew; then
+              exit 0
+            fi
+
+            rm -rf dist/homebrew/*
+            sleep 10
+          done
+
+          echo "Homebrew formula artifact for $TAG did not appear in time"
+          exit 1
+
+      - name: Sync formula into tap
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -z "${TAP_PUSH_TOKEN:-}" ]; then
+            echo "Missing HOMEBREW_TAP_GITHUB_TOKEN secret"
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${TAP_PUSH_TOKEN}@github.com/${TAP_REPO}.git" dist/homebrew-tap
+          mkdir -p dist/homebrew-tap/Formula
+          cp "dist/homebrew/$FORMULA_NAME" "dist/homebrew-tap/Formula/$FORMULA_NAME"
+
+          cd dist/homebrew-tap
+
+          if [ -z "$(git status --short -- Formula/"$FORMULA_NAME")" ]; then
+            echo "Formula already up to date"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/"$FORMULA_NAME"
+          git commit -m "chore(formula): update codex-threadripper to ${GITHUB_REF_NAME}"
+          git push origin HEAD:main

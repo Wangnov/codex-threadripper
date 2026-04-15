@@ -31,6 +31,13 @@
 cargo install codex-threadripper
 ```
 
+也可以通过 Homebrew 安装：
+
+```bash
+brew tap wangnov/tap
+brew install codex-threadripper
+```
+
 也可以从源码目录直接运行：
 
 ```bash
@@ -76,6 +83,13 @@ It helps Codex thread lists and resume flows stay in one provider bucket, so thr
 
 ```bash
 cargo install codex-threadripper
+```
+
+### Install with Homebrew
+
+```bash
+brew tap wangnov/tap
+brew install codex-threadripper
 ```
 
 ### Commands
@@ -136,6 +150,10 @@ GitHub Release keeps the native archives and installers. npm uses a matrix packa
 The root package stays human-friendly. The platform packages carry the native binaries.
 
 `.github/workflows/npm-publish.yml` runs on version tags, waits for the GitHub Release artifacts to appear, assembles the npm matrix locally in CI, and publishes both the platform packages and the root package with npm trusted publishing.
+
+`.github/workflows/homebrew-tap-sync.yml` runs on version tags, waits for the published `codex-threadripper.rb` formula artifact, and updates `Wangnov/homebrew-tap` so `brew tap wangnov/tap && brew install codex-threadripper` keeps working.
+
+The Homebrew sync workflow needs a repository secret named `HOMEBREW_TAP_GITHUB_TOKEN` with write access to `Wangnov/homebrew-tap`.
 
 Whenever you change `dist-workspace.toml`, rerun:
 
