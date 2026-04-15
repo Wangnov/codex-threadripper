@@ -33,15 +33,17 @@
 
 # 中文
 
-`codex-threadripper` 是 CLI 工具，专门解决在 `CODEX_HOME` 里的 `config.toml` 中，切换不同的 model_provider 之后，会话的线程历史被分散到不同 provider 桶里，导致无法使用 `codex resume` 或在 Codex APP 中访问不通 Provider 创建的会话的问题。
+你有没有遇到过这种情况：在 Codex 里切到另一个 model_provider，然后发现之前的会话全不见了？打开 Codex.app，列表空空如也；执行 `codex resume`，什么都恢复不了。
 
-它的做法是，把 `CODEX_HOME/state_5.sqlite` 持续收敛到当前 `model_provider`，这样 `codex resume`、Codex.app 和基于 app-server 的客户端都能看到所有完整的线程历史。
+会话其实还在，只是 `state_5.sqlite` 里每条线程记录了创建它的 provider，切换 provider 之后 Codex 只会显示当前 provider 的线程，其他的就像蒸发了一样。
 
-## 它适合谁
+`codex-threadripper` 就是为了解决这件事而生的。它会把 `CODEX_HOME/state_5.sqlite` 里所有线程的 provider 字段统一收敛到你当前用的那个，这样不管你来回怎么切，`codex resume`、Codex.app 和 app-server 客户端都能看到完整的历史记录。
 
-- 你会在同一个 Codex 里切换多个 model_provider
-- 你希望 `resume` 和 APP 的会话列表里能看到不同的 Provider 的任何历史会话线程
-- 你可能需要频繁地切换 model_provider，想把无法打开不同 Provider 会话这件事无感地解决掉
+## 适合谁用
+
+- 你会在同一个 Codex 里频繁切换不同的 model_provider
+- 你希望所有历史会话在任何 provider 下都能打开和续接
+- 你不想每次切完 provider 之后手动处理这个问题
 
 ## 安装
 
@@ -70,60 +72,57 @@ cargo binstall codex-threadripper
 cargo install codex-threadripper
 ```
 
-### cargo binstall
-
-```bash
-cargo binstall codex-threadripper
-```
-
 ### 直接下载二进制
 
-从 [最新 GitHub Release](https://github.com/Wangnov/codex-threadripper/releases/latest) 下载平台对应的压缩包、安装脚本或 MSI。
+从 [最新 GitHub Release](https://github.com/Wangnov/codex-threadripper/releases/latest) 下载对应平台的压缩包、安装脚本或 MSI 安装器。
 
-## 快速开始
+## 快速上手
 
 ```bash
-# 检查你的 CODEX_HOME 下当前有多少个不同 model_provider 的会话线程
+# 先看看现在的情况——有多少线程散落在不同的 provider 桶里
 codex-threadripper status
-# 同步所有不同的 model_provider 会话线程
+
+# 立刻做一次收敛（会先备份，放心）
 codex-threadripper sync
-# 在后台持续监控
+
+# 在前台持续监听，实时处理新线程
 codex-threadripper watch
-# 安装并作为系统后台服务持续监控
+
+# 装成系统后台服务，以后开机自动跑
 codex-threadripper install-service
 ```
 
 ## 命令说明
 
-- `status`：查看当前 provider、SQLite 分布和后台服务状态
-- `sync`：立即执行一次收敛，并先在 `CODEX_HOME/backups/` 里写入一个带时间戳的备份
-- `watch`：持续监听配置变化和新增线程，自动收敛到当前 provider
-- `print-service-config`：打印当前平台的后台服务配置
-- `install-service`：安装并启动后台服务
-- `uninstall-service`：停止并移除后台服务
+- `status`：查看当前 provider、SQLite 里各 provider 的线程分布，以及后台服务的运行状态
+- `sync`：立即执行一次收敛。执行前会在 `CODEX_HOME/backups/` 里写一份带时间戳的备份
+- `watch`：持续监听 `config.toml` 的变化，同时定时收敛新增的线程记录
+- `print-service-config`：打印当前平台的后台服务配置内容（launchd plist / systemd unit / Windows 启动脚本）
+- `install-service`：把后台服务装到系统里并立即启动
+- `uninstall-service`：停止并卸载后台服务
 
-兼容旧命令别名：
+以下旧命令名仍然有效，会自动映射到新命令：
 
-- `print-plist`
-- `install-launchd`
-- `uninstall-launchd`
+- `print-plist` → `print-service-config`
+- `install-launchd` → `install-service`
+- `uninstall-launchd` → `uninstall-service`
 
-`watch` 默认轮询间隔是 `500ms`。`watch`、`print-service-config` 和 `install-service` 都支持 `--poll-interval-ms`。
+`watch` 的默认轮询间隔是 500ms。`watch`、`print-service-config` 和 `install-service` 都支持 `--poll-interval-ms` 来自定义间隔。
 
 ## 它会改什么
 
-- `sync` 会备份并更新 `CODEX_HOME/state_5.sqlite`
-- `watch` 会持续处理新增的脏线程记录
-- 日常使用不会改写 rollout 文件，如果想查询某个thread的具体model_provider，仍可回源去查看
+- `sync` 会在 `CODEX_HOME/backups/` 里创建备份，然后更新 `state_5.sqlite` 里的 `model_provider` 字段
+- `watch` 在运行期间会持续处理新写入的线程记录，保持数据库与当前 provider 对齐
+- 工具不会动 rollout 文件，每条线程原本是用哪个 provider 创建的，仍然可以从源文件里追溯
 
-## 平台与语言
+## 平台支持
 
-- `status`、`sync`、`watch` 适合任何能访问 `CODEX_HOME/state_5.sqlite` 的环境
-- macOS 使用 `launchd`
-- Linux 使用 `systemd --user`
-- Windows 使用启动文件夹中的后台启动脚本
-- 已发布产物覆盖 Apple Silicon macOS、Intel macOS、Linux x64、Linux ARM64、Windows x64
-- 当前支持简体中文和英文
+- `status`、`sync`、`watch` 在任何能访问 `CODEX_HOME/state_5.sqlite` 的环境下都能用
+- macOS 后台服务使用 `launchd`
+- Linux 后台服务使用 `systemd --user`（没有 systemd 时会退回到独立的后台进程）
+- Windows 后台服务使用启动文件夹里的批处理脚本
+- 发布的二进制覆盖 Apple Silicon macOS、Intel macOS、Linux x64、Linux ARM64、Windows x64
+- CLI 界面同时支持简体中文和英文，根据系统语言自动切换
 
 ## 从源码运行
 
@@ -137,15 +136,17 @@ cargo run -- --help
 
 # English
 
-`codex-threadripper` is a CLI tool for one specific problem: after switching `model_provider` in `CODEX_HOME/config.toml`, thread history can get split across different provider buckets, which makes some sessions unreachable from `codex resume` or from Codex.app when they were created under another provider.
+Here's a situation you might recognize: you switch `model_provider` in Codex, and suddenly your session list is empty. `codex resume` finds nothing. The Codex app shows a blank slate.
 
-It works by continuously reconciling `CODEX_HOME/state_5.sqlite` toward the current `model_provider`, so `codex resume`, Codex.app, and app-server based clients can all see the full thread history in one place.
+Your sessions aren't gone. They're just filed under a different provider in `state_5.sqlite`. Codex only shows threads that match the active provider, so anything created under a different one becomes effectively invisible.
+
+`codex-threadripper` fixes this by rewriting the `model_provider` field on every thread row in `CODEX_HOME/state_5.sqlite` to match whichever provider you have active right now. After that, `codex resume`, Codex.app, and app-server clients all see the full history — no matter how many times you've switched.
 
 ## Who this is for
 
-- You switch between multiple `model_provider` values in one Codex home
-- You want `resume` and the app session list to show thread history created under any provider
-- You switch providers often and want this fixed quietly in the background
+- You switch between multiple `model_provider` values in the same Codex home
+- You want thread history to follow you across provider switches, not stay locked to the provider that created each session
+- You'd rather have this handled quietly in the background than think about it
 
 ## Install
 
@@ -176,53 +177,56 @@ cargo install codex-threadripper
 
 ### Direct binary download
 
-Download the right archive, installer script, or MSI from the
+Grab the right archive, installer script, or MSI from the
 [latest GitHub Release](https://github.com/Wangnov/codex-threadripper/releases/latest).
 
 ## Quick start
 
 ```bash
-# Check how many thread rows currently live under different model providers
+# See how your threads are currently distributed across providers
 codex-threadripper status
-# Reconcile all thread rows into the current model provider
+
+# Reconcile everything right now (a backup is written first)
 codex-threadripper sync
-# Keep watching in the background
+
+# Keep watching in the foreground, handling new threads as they arrive
 codex-threadripper watch
-# Install and run it as a background service
+
+# Or install it as a background service so it just runs from now on
 codex-threadripper install-service
 ```
 
 ## Commands
 
-- `status`: show the current provider, SQLite distribution, and background service state
-- `sync`: reconcile once right now and write a timestamped backup into `CODEX_HOME/backups/`
-- `watch`: keep listening for config changes and new thread rows
-- `print-service-config`: print the background service config for the current platform
-- `install-service`: install and start the background service
-- `uninstall-service`: stop and remove the background service
+- `status`: show the active provider, the per-provider thread counts from SQLite, and whether the background service is running
+- `sync`: reconcile once right now, writing a timestamped backup to `CODEX_HOME/backups/` before touching anything
+- `watch`: keep watching `config.toml` for provider changes and periodically reconcile any newly added thread rows
+- `print-service-config`: print the platform-specific service config (launchd plist, systemd unit, or Windows startup script) without installing it
+- `install-service`: write the service config and start the service
+- `uninstall-service`: stop and remove the service
 
-Legacy aliases still work:
+These legacy command names still work:
 
-- `print-plist`
-- `install-launchd`
-- `uninstall-launchd`
+- `print-plist` → `print-service-config`
+- `install-launchd` → `install-service`
+- `uninstall-launchd` → `uninstall-service`
 
-`watch` uses `500ms` by default. `watch`, `print-service-config`, and `install-service` accept `--poll-interval-ms`.
+`watch` polls every 500ms by default. You can change that with `--poll-interval-ms` on `watch`, `print-service-config`, and `install-service`.
 
 ## What it changes
 
-- `sync` backs up and updates `CODEX_HOME/state_5.sqlite`
-- `watch` keeps reconciling newly added dirty thread rows
-- everyday usage leaves rollout files untouched, so if you want to inspect the original provider of a thread, you can still trace it back to the source data
+- `sync` writes a backup and then updates the `model_provider` column in `state_5.sqlite`
+- `watch` keeps that column aligned with the active provider as new threads are written
+- Rollout files are never touched, so you can always trace a thread back to its original provider if you need to
 
-## Platforms and languages
+## Platforms
 
-- `status`, `sync`, and `watch` fit any environment that can access `CODEX_HOME/state_5.sqlite`
+- `status`, `sync`, and `watch` work anywhere you can access `CODEX_HOME/state_5.sqlite`
 - macOS uses `launchd`
-- Linux uses `systemd --user`
-- Windows uses a Startup folder background launcher
-- published assets cover Apple Silicon macOS, Intel macOS, Linux x64, Linux ARM64, and Windows x64
-- the CLI currently supports Simplified Chinese and English
+- Linux uses `systemd --user`, falling back to a detached process when systemd isn't available
+- Windows uses a startup folder script
+- Prebuilt binaries are available for Apple Silicon macOS, Intel macOS, Linux x64, Linux ARM64, and Windows x64
+- The CLI detects your system language and switches between Simplified Chinese and English automatically
 
 ## Run from source
 
