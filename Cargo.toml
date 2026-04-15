@@ -28,7 +28,7 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.4"
 notify = "8.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.15"
 toml = "0.8"

@@ -211,14 +211,88 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+  smoke-test-linux:
+    needs:
+      - plan
+      - build-local-artifacts
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch Linux release archive
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-build-local-x86_64-unknown-linux-gnu
+          path: dist/release-assets
+      - name: Run Linux smoke test
+        shell: bash
+        run: |
+          ARCHIVE="$(find dist/release-assets -name 'codex-threadripper-x86_64-unknown-linux-gnu.tar.xz' -print -quit)"
+          python scripts/smoke_release.py --platform linux --archive "$ARCHIVE"
+
+  smoke-test-macos:
+    needs:
+      - plan
+      - build-local-artifacts
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch macOS release archive
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-build-local-x86_64-apple-darwin
+          path: dist/release-assets
+      - name: Run macOS smoke test
+        shell: bash
+        run: |
+          ARCHIVE="$(find dist/release-assets -name 'codex-threadripper-x86_64-apple-darwin.tar.xz' -print -quit)"
+          python scripts/smoke_release.py --platform macos --archive "$ARCHIVE"
+
+  smoke-test-windows:
+    needs:
+      - plan
+      - build-local-artifacts
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch Windows release archive
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-build-local-x86_64-pc-windows-msvc
+          path: dist/release-assets
+      - name: Run Windows smoke test
+        shell: bash
+        run: |
+          ARCHIVE="$(find dist/release-assets -name 'codex-threadripper-x86_64-pc-windows-msvc.zip' -print -quit)"
+          python scripts/smoke_release.py --platform windows --archive "$ARCHIVE"
   # Determines if we should publish/announce
   host:
     needs:
       - plan
       - build-local-artifacts
       - build-global-artifacts
+      - smoke-test-linux
+      - smoke-test-macos
+      - smoke-test-windows
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && needs.smoke-test-linux.result == 'success' && needs.smoke-test-macos.result == 'success' && needs.smoke-test-windows.result == 'success' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"

@@ -13,6 +13,7 @@ use notify::RecursiveMode;
 use notify::Watcher;
 use rusqlite::Connection;
 use rusqlite::TransactionBehavior;
+use rusqlite::backup::Backup;
 use serde::Deserialize;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -24,10 +25,12 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PROVIDER: &str = "openai";
-const DEFAULT_POLL_INTERVAL_MS: u64 = 2_000;
+const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 const SERVICE_LABEL: &str = "dev.wangnov.codex-threadripper";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +112,7 @@ struct ReconcileSummary {
     changed_rows: u64,
     total_rows: u64,
     elapsed: Duration,
+    backup_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -136,7 +140,7 @@ fn main() -> Result<()> {
             print_status(locale, &summary);
         }
         Command::Sync => {
-            let summary = reconcile_once(&codex_home, cli.provider.as_deref())?;
+            let summary = reconcile_once_with_backup(&codex_home, cli.provider.as_deref())?;
             print_sync_summary(locale, sync_complete_title(locale), &summary);
         }
         Command::Watch { poll_interval_ms } => {
@@ -477,13 +481,36 @@ fn reconcile_once(codex_home: &Path, provider_override: Option<&str>) -> Result<
     };
     let sqlite_path = codex_home.join("state_5.sqlite");
     let started = Instant::now();
-    let (changed_rows, total_rows) = reconcile_sqlite(&sqlite_path, provider.as_str())?;
+    let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
 
     Ok(ReconcileSummary {
         provider,
         changed_rows,
         total_rows,
         elapsed: started.elapsed(),
+        backup_path: None,
+    })
+}
+
+fn reconcile_once_with_backup(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+) -> Result<ReconcileSummary> {
+    let provider = match provider_override {
+        Some(provider) => provider.to_string(),
+        None => read_provider_from_config(codex_home)?,
+    };
+    let sqlite_path = codex_home.join("state_5.sqlite");
+    let started = Instant::now();
+    let (changed_rows, total_rows, backup_path) =
+        reconcile_sqlite_with_backup(&sqlite_path, provider.as_str())?;
+
+    Ok(ReconcileSummary {
+        provider,
+        changed_rows,
+        total_rows,
+        elapsed: started.elapsed(),
+        backup_path: Some(backup_path),
     })
 }
 
@@ -527,7 +554,7 @@ fn inspect_sqlite_distribution(
     Ok((total_rows, mismatched_rows, distribution))
 }
 
-fn reconcile_sqlite(sqlite_path: &Path, provider: &str) -> Result<(u64, u64)> {
+fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> Result<(u64, u64)> {
     let mut connection = Connection::open(sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
@@ -542,6 +569,46 @@ fn reconcile_sqlite(sqlite_path: &Path, provider: &str) -> Result<(u64, u64)> {
     transaction.commit()?;
 
     Ok((changed_rows, total_rows))
+}
+
+fn reconcile_sqlite_with_backup(sqlite_path: &Path, provider: &str) -> Result<(u64, u64, PathBuf)> {
+    let backups_dir = sqlite_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("backups");
+    std::fs::create_dir_all(&backups_dir)
+        .with_context(|| format!("failed to create {}", backups_dir.display()))?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is earlier than UNIX_EPOCH")?
+        .as_millis();
+    let backup_name = format!("state_5.sqlite.{timestamp}.bak");
+    let backup_path = backups_dir.join(&backup_name);
+    let backup_temp_path = backups_dir.join(format!("{backup_name}.tmp"));
+
+    if backup_temp_path.exists() {
+        std::fs::remove_file(&backup_temp_path)
+            .with_context(|| format!("failed to remove {}", backup_temp_path.display()))?;
+    }
+
+    create_sqlite_backup(sqlite_path, &backup_temp_path)?;
+    std::fs::rename(&backup_temp_path, &backup_path)
+        .with_context(|| format!("failed to finalize {}", backup_path.display()))?;
+
+    let (changed_rows, total_rows) = reconcile_sqlite_in_place(sqlite_path, provider)?;
+    Ok((changed_rows, total_rows, backup_path))
+}
+
+fn create_sqlite_backup(sqlite_path: &Path, backup_path: &Path) -> Result<()> {
+    let source = Connection::open(sqlite_path)
+        .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
+    source.busy_timeout(Duration::from_secs(5))?;
+    let mut destination = Connection::open(backup_path)
+        .with_context(|| format!("failed to open {}", backup_path.display()))?;
+    let backup = Backup::new(&source, &mut destination)?;
+    backup.step(-1)?;
+    Ok(())
 }
 
 fn install_launchd(
@@ -687,9 +754,22 @@ fn default_logs_dir() -> PathBuf {
 }
 
 fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .with_context(|| "HOME is not set".to_string())
+    if let Some(path) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("USERPROFILE") {
+        return Ok(PathBuf::from(path));
+    }
+    let home_drive = std::env::var_os("HOMEDRIVE");
+    let home_path = std::env::var_os("HOMEPATH");
+    match (home_drive, home_path) {
+        (Some(drive), Some(path)) => {
+            let mut joined = PathBuf::from(drive);
+            joined.push(path);
+            Ok(joined)
+        }
+        _ => anyhow::bail!("HOME is not set"),
+    }
 }
 
 fn launchctl_domain() -> Result<String> {
@@ -831,6 +911,9 @@ fn print_sync_summary(locale: Locale, title: &str, summary: &ReconcileSummary) {
         sync_elapsed_label(locale),
         summary.elapsed.as_millis()
     );
+    if let Some(backup_path) = &summary.backup_path {
+        println!("{}: {}", sync_backup_label(locale), backup_path.display());
+    }
 }
 
 fn yes_no(locale: Locale, value: bool) -> &'static str {
@@ -1266,9 +1349,18 @@ fn sync_elapsed_label(locale: Locale) -> &'static str {
     }
 }
 
+fn sync_backup_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Backup",
+        Locale::ZhHans => "备份文件",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::APP_VERSION;
+    use super::Cli;
+    use super::Command;
     use super::DEFAULT_POLL_INTERVAL_MS;
     use super::Locale;
     use super::build_launchd_plist;
@@ -1278,8 +1370,10 @@ mod tests {
     use super::parse_apple_languages;
     use super::parse_locale_tag;
     use super::read_provider_from_config;
-    use super::reconcile_sqlite;
+    use super::reconcile_sqlite_in_place;
+    use super::reconcile_sqlite_with_backup;
     use anyhow::Result;
+    use clap::FromArgMatches;
     use clap::error::ErrorKind;
     use rusqlite::Connection;
     use std::fs;
@@ -1377,12 +1471,12 @@ mod tests {
     }
 
     #[test]
-    fn reconciles_sqlite_rows() -> Result<()> {
+    fn reconciles_sqlite_rows_in_place() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let sqlite_path = dir.path().join("state_5.sqlite");
         seed_sqlite(&sqlite_path)?;
 
-        let (changed_rows, total_rows) = reconcile_sqlite(&sqlite_path, "openai")?;
+        let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, "openai")?;
         let connection = Connection::open(&sqlite_path)?;
         let other_rows: u64 = connection.query_row(
             "SELECT COUNT(*) FROM threads WHERE model_provider <> 'openai'",
@@ -1393,6 +1487,50 @@ mod tests {
         assert_eq!(changed_rows, 2);
         assert_eq!(total_rows, 3);
         assert_eq!(other_rows, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_backup_preserves_pre_reconcile_state() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sqlite_path = dir.path().join("state_5.sqlite");
+        seed_sqlite(&sqlite_path)?;
+
+        let (changed_rows, total_rows, backup_path) =
+            reconcile_sqlite_with_backup(&sqlite_path, "openai")?;
+        let live_connection = Connection::open(&sqlite_path)?;
+        let backup_connection = Connection::open(&backup_path)?;
+        let live_other_rows: u64 = live_connection.query_row(
+            "SELECT COUNT(*) FROM threads WHERE model_provider <> 'openai'",
+            [],
+            |row| row.get(0),
+        )?;
+        let backup_other_rows: u64 = backup_connection.query_row(
+            "SELECT COUNT(*) FROM threads WHERE model_provider <> 'openai'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(changed_rows, 2);
+        assert_eq!(total_rows, 3);
+        assert_eq!(live_other_rows, 0);
+        assert_eq!(backup_other_rows, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn watch_uses_five_hundred_ms_by_default() -> Result<()> {
+        let matches =
+            localized_command(Locale::En).try_get_matches_from(["codex-threadripper", "watch"])?;
+        let cli = Cli::from_arg_matches(&matches)?;
+
+        match cli.command {
+            Command::Watch { poll_interval_ms } => {
+                assert_eq!(poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
+            }
+            other => panic!("expected watch command, got {other:?}"),
+        }
+
         Ok(())
     }
 

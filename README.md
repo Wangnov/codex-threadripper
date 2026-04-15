@@ -16,8 +16,10 @@
   - 查看当前 config provider、SQLite 分布和后台服务状态
 - `sync`
   - 立刻执行一次 SQLite 收敛
+  - 先创建一个时间戳备份，再改写 `state_5.sqlite`
 - `watch`
   - 持续监听 `config.toml`，并定时收敛新增线程
+  - 默认轮询间隔是 500ms
 - `print-plist`
   - 打印 `launchd` plist
 - `install-launchd`
@@ -50,8 +52,13 @@ cargo run -- --help
 codex-threadripper status
 codex-threadripper sync
 codex-threadripper watch
+codex-threadripper watch --poll-interval-ms 1000
 codex-threadripper install-launchd
 ```
+
+`sync` 会在 `CODEX_HOME/backups/` 下写入一个带时间戳的 SQLite 备份文件。
+
+`watch` 和 `install-launchd` 都支持 `--poll-interval-ms`。默认值是 `500`。
 
 ## 本地化
 
@@ -95,11 +102,13 @@ brew install codex-threadripper
 ### Commands
 
 - `status` shows the current provider, SQLite distribution, and background service state
-- `sync` reconciles SQLite once right now
+- `sync` reconciles SQLite once right now and writes a timestamped backup into `CODEX_HOME/backups/`
 - `watch` keeps listening for provider changes and new thread rows
 - `print-plist` prints the generated `launchd` plist
 - `install-launchd` installs the background service
 - `uninstall-launchd` removes the background service
+
+`watch` and `install-launchd` accept `--poll-interval-ms`. The default is `500`.
 
 ## Release flow
 
@@ -152,6 +161,8 @@ The root package stays human-friendly. The platform packages carry the native bi
 `.github/workflows/npm-publish.yml` runs on version tags, waits for the GitHub Release artifacts to appear, assembles the npm matrix locally in CI, and publishes both the platform packages and the root package with npm trusted publishing.
 
 `.github/workflows/homebrew-tap-sync.yml` runs on version tags, waits for the published `codex-threadripper.rb` formula artifact, and updates `Wangnov/homebrew-tap` so `brew tap wangnov/tap && brew install codex-threadripper` keeps working.
+
+`.github/workflows/release.yml` runs a cross-platform smoke test before the GitHub Release is published. The smoke test downloads the packaged release archives for Linux, macOS, and Windows, seeds a dirty `CODEX_HOME` with mixed providers plus session files, runs `status`, runs `sync`, verifies the backup, and then runs `watch` to confirm that a newly inserted dirty thread is reconciled automatically.
 
 The Homebrew sync workflow needs a repository secret named `HOMEBREW_TAP_GITHUB_TOKEN` with write access to `Wangnov/homebrew-tap`.
 
