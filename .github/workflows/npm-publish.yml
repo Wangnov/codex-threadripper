@@ -1,17 +1,9 @@
 name: Publish npm packages
 
 on:
-  workflow_run:
-    workflows:
-      - Release
-    types:
-      - completed
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Git tag to publish from
-        required: true
-        type: string
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
 
 permissions:
   contents: read
@@ -19,7 +11,6 @@ permissions:
 
 jobs:
   publish-npm-matrix:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ github.token }}
@@ -28,18 +19,29 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download release artifacts
+      - name: Wait for release artifacts
         run: |
-          TAG="${{ inputs.release_tag || github.event.workflow_run.head_branch }}"
+          TAG="${GITHUB_REF_NAME}"
           mkdir -p dist/release-assets
-          gh release download "$TAG" \
-            --repo "${{ github.repository }}" \
-            --pattern "codex-threadripper-aarch64-apple-darwin.tar.xz" \
-            --pattern "codex-threadripper-aarch64-unknown-linux-gnu.tar.xz" \
-            --pattern "codex-threadripper-x86_64-apple-darwin.tar.xz" \
-            --pattern "codex-threadripper-x86_64-unknown-linux-gnu.tar.xz" \
-            --pattern "codex-threadripper-x86_64-pc-windows-msvc.zip" \
-            --dir dist/release-assets
+
+          for attempt in $(seq 1 30); do
+            if gh release download "$TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern "codex-threadripper-aarch64-apple-darwin.tar.xz" \
+              --pattern "codex-threadripper-aarch64-unknown-linux-gnu.tar.xz" \
+              --pattern "codex-threadripper-x86_64-apple-darwin.tar.xz" \
+              --pattern "codex-threadripper-x86_64-unknown-linux-gnu.tar.xz" \
+              --pattern "codex-threadripper-x86_64-pc-windows-msvc.zip" \
+              --dir dist/release-assets; then
+              exit 0
+            fi
+
+            rm -rf dist/release-assets/*
+            sleep 10
+          done
+
+          echo "Release artifacts for $TAG did not appear in time"
+          exit 1
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -49,7 +51,7 @@ jobs:
 
       - name: Build npm package matrix
         run: |
-          TAG="${{ inputs.release_tag || github.event.workflow_run.head_branch }}"
+          TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           node scripts/build-npm-matrix.mjs \
             --version "$VERSION" \

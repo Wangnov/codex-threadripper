@@ -135,7 +135,7 @@ GitHub Release keeps the native archives and installers. npm uses a matrix packa
 
 The root package stays human-friendly. The platform packages carry the native binaries.
 
-`.github/workflows/npm-publish.yml` downloads the release artifacts, assembles the npm matrix locally in CI, and publishes both the platform packages and the root package with npm trusted publishing.
+`.github/workflows/npm-publish.yml` runs on version tags, waits for the GitHub Release artifacts to appear, assembles the npm matrix locally in CI, and publishes both the platform packages and the root package with npm trusted publishing.
 
 Whenever you change `dist-workspace.toml`, rerun:
 
