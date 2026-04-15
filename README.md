@@ -112,27 +112,32 @@ brew install codex-threadripper
 
 ## Release flow
 
-This project uses a tag-driven `cargo-release` + `cargo-dist` flow.
+This project uses a two-stage `cargo-release` + `cargo-dist` flow.
 
-Preview the next release:
-
-```bash
-cargo release patch --dry-run
-```
-
-Publish a real release:
+Prepare the next release locally without publishing, tagging, or pushing:
 
 ```bash
-cargo release patch --execute
+cargo release patch --execute --no-publish --no-tag --no-push --no-confirm
+git push origin main
 ```
 
-The release tag format is:
+Run the `Release candidate` workflow against `main`. It builds packaged archives on Linux, macOS, and Windows, then runs the smoke test against those archives.
+
+After the release candidate workflow passes, publish and tag the prepared version:
+
+```bash
+cargo release publish --execute --no-confirm
+cargo release tag --execute --no-confirm
+cargo release push --execute --no-confirm
+```
+
+The final release tag format is:
 
 ```text
 vX.Y.Z
 ```
 
-After the tag is pushed, GitHub Actions runs `cargo-dist` and builds release artifacts for:
+After the final tag is pushed, GitHub Actions runs `cargo-dist` and builds release artifacts for:
 
 - macOS Intel
 - macOS Apple Silicon
@@ -158,15 +163,17 @@ GitHub Release keeps the native archives and installers. npm uses a matrix packa
 
 The root package stays human-friendly. The platform packages carry the native binaries.
 
-`.github/workflows/npm-publish.yml` runs on version tags, waits for the GitHub Release artifacts to appear, assembles the npm matrix locally in CI, and publishes both the platform packages and the root package with npm trusted publishing.
+`.github/workflows/release.yml` stays under cargo-dist control. Regenerate it with `dist generate --mode ci` or `cargo dist init --yes` whenever dist metadata changes.
 
-`.github/workflows/homebrew-tap-sync.yml` runs on version tags, waits for the published `codex-threadripper.rb` formula artifact, and updates `Wangnov/homebrew-tap` so `brew tap wangnov/tap && brew install codex-threadripper` keeps working.
+`.github/workflows/release-candidate.yml` is the release gate. It builds packaged archives for Linux, macOS, and Windows with `dist build`, then runs the smoke test against those archives.
 
-`.github/workflows/release.yml` runs a cross-platform smoke test before the GitHub Release is published. The smoke test downloads the packaged release archives for Linux, macOS, and Windows, seeds a dirty `CODEX_HOME` with mixed providers plus session files, runs `status`, runs `sync`, verifies the backup, and then runs `watch` to confirm that a newly inserted dirty thread is reconciled automatically.
+`.github/workflows/npm-publish.yml` runs on final version tags, waits for the GitHub Release artifacts to appear, assembles the npm matrix locally in CI, and publishes both the platform packages and the root package with npm trusted publishing.
+
+`.github/workflows/homebrew-tap-sync.yml` runs on final version tags, waits for the published `codex-threadripper.rb` formula artifact, and updates `Wangnov/homebrew-tap` so `brew tap wangnov/tap && brew install codex-threadripper` keeps working.
 
 The Homebrew sync workflow needs a repository secret named `HOMEBREW_TAP_GITHUB_TOKEN` with write access to `Wangnov/homebrew-tap`.
 
-Whenever you change `dist-workspace.toml`, rerun:
+Whenever you change `dist-workspace.toml`, Cargo metadata like repository URLs, or MSI/homebrew installer settings, rerun:
 
 ```bash
 cargo dist init --yes

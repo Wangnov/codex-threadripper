@@ -1,0 +1,155 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to validate
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh
+
+      - name: Build Linux release archive
+        shell: bash
+        run: |
+          dist build --artifacts=local --target x86_64-unknown-linux-gnu --output-format=json > dist-manifest.json
+
+      - name: Run Linux smoke test
+        shell: bash
+        run: |
+          ARCHIVE="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("dist-manifest.json").read_text())
+          for artifact in manifest["artifacts"].values():
+              if artifact["kind"] == "executable-zip" and "x86_64-unknown-linux-gnu" in artifact["target_triples"]:
+                  print(artifact["path"])
+                  break
+          PY
+          )"
+          python scripts/smoke_release.py --platform linux --archive "$ARCHIVE"
+
+      - name: Upload Linux build outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-linux
+          path: |
+            dist-manifest.json
+            target/distrib/*
+
+  smoke-test-macos:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh
+
+      - name: Build macOS release archive
+        shell: bash
+        run: |
+          dist build --artifacts=local --target x86_64-apple-darwin --output-format=json > dist-manifest.json
+
+      - name: Run macOS smoke test
+        shell: bash
+        run: |
+          ARCHIVE="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("dist-manifest.json").read_text())
+          for artifact in manifest["artifacts"].values():
+              if artifact["kind"] == "executable-zip" and "x86_64-apple-darwin" in artifact["target_triples"]:
+                  print(artifact["path"])
+                  break
+          PY
+          )"
+          python scripts/smoke_release.py --platform macos --archive "$ARCHIVE"
+
+      - name: Upload macOS build outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-macos
+          path: |
+            dist-manifest.json
+            target/distrib/*
+
+  smoke-test-windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh
+
+      - name: Build Windows release archive
+        shell: bash
+        run: |
+          dist build --artifacts=local --target x86_64-pc-windows-msvc --output-format=json > dist-manifest.json
+
+      - name: Run Windows smoke test
+        shell: bash
+        run: |
+          ARCHIVE="$(python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("dist-manifest.json").read_text())
+          for artifact in manifest["artifacts"].values():
+              if artifact["kind"] == "executable-zip" and "x86_64-pc-windows-msvc" in artifact["target_triples"]:
+                  print(artifact["path"])
+                  break
+          PY
+          )"
+          python scripts/smoke_release.py --platform windows --archive "$ARCHIVE"
+
+      - name: Upload Windows build outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate-windows
+          path: |
+            dist-manifest.json
+            target/distrib/*
