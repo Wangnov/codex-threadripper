@@ -6,6 +6,7 @@ use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::Parser;
 use clap::Subcommand;
+use fs2::FileExt;
 use notify::Config as NotifyConfig;
 use notify::EventKind;
 use notify::RecommendedWatcher;
@@ -14,7 +15,10 @@ use notify::Watcher;
 use rusqlite::Connection;
 use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
+use rusqlite::backup::StepResult;
 use serde::Deserialize;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -185,7 +189,16 @@ fn main() -> Result<()> {
 fn parse_cli(locale: Locale) -> Result<Cli> {
     let command = localized_command(locale);
     let matches = command.clone().get_matches();
-    Cli::from_arg_matches(&matches).map_err(|err| anyhow::anyhow!(err.to_string()))
+    let cli = Cli::from_arg_matches(&matches).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    validate_provider_override(locale, cli.provider.as_deref())?;
+    Ok(cli)
+}
+
+fn validate_provider_override(locale: Locale, provider: Option<&str>) -> Result<()> {
+    if provider.is_some_and(|value| value.trim().is_empty()) {
+        anyhow::bail!(provider_empty_error(locale));
+    }
+    Ok(())
 }
 
 fn localized_command(locale: Locale) -> clap::Command {
@@ -376,6 +389,20 @@ fn run_watch(
     provider_override: Option<String>,
     poll_interval: Duration,
 ) -> Result<()> {
+    let lock_path = codex_home.join("watch.lock");
+    let watch_lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    if let Err(err) = watch_lock.try_lock_exclusive() {
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::bail!(watch_already_running_error(locale));
+        }
+        return Err(err).with_context(|| format!("failed to lock {}", lock_path.display()));
+    }
+
     let config_path = codex_home.join("config.toml");
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_handler = Arc::clone(&shutdown);
@@ -412,11 +439,17 @@ fn run_watch(
         match rx.recv_timeout(timeout) {
             Ok(Ok(event)) => {
                 if touches_config_file(&event, &config_path) {
-                    let summary = reconcile_once(codex_home, provider_override.as_deref())?;
-                    if summary.provider != last_provider || summary.changed_rows > 0 {
-                        print_sync_summary(locale, config_change_title(locale), &summary);
+                    match reconcile_once(codex_home, provider_override.as_deref()) {
+                        Ok(summary) => {
+                            if summary.provider != last_provider || summary.changed_rows > 0 {
+                                print_sync_summary(locale, config_change_title(locale), &summary);
+                            }
+                            last_provider = summary.provider;
+                        }
+                        Err(err) => {
+                            eprintln!("[watch] reconcile skipped: {err:#}");
+                        }
                     }
-                    last_provider = summary.provider;
                     next_poll_deadline = Instant::now() + poll_interval;
                 }
             }
@@ -424,11 +457,21 @@ fn run_watch(
                 eprintln!("{}", watcher_error_message(locale, err));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let summary = reconcile_once(codex_home, provider_override.as_deref())?;
-                if summary.provider != last_provider || summary.changed_rows > 0 {
-                    print_sync_summary(locale, background_reconcile_title(locale), &summary);
+                match reconcile_once(codex_home, provider_override.as_deref()) {
+                    Ok(summary) => {
+                        if summary.provider != last_provider || summary.changed_rows > 0 {
+                            print_sync_summary(
+                                locale,
+                                background_reconcile_title(locale),
+                                &summary,
+                            );
+                        }
+                        last_provider = summary.provider;
+                    }
+                    Err(err) => {
+                        eprintln!("[watch] reconcile skipped: {err:#}");
+                    }
                 }
-                last_provider = summary.provider;
                 next_poll_deadline = Instant::now() + poll_interval;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -436,7 +479,6 @@ fn run_watch(
             }
         }
     }
-
     println!("{}", watch_stopped_message(locale));
     Ok(())
 }
@@ -523,6 +565,7 @@ fn read_provider_from_config(codex_home: &Path) -> Result<String> {
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
     Ok(parsed
         .model_provider
+        .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()))
 }
 
@@ -552,13 +595,14 @@ fn inspect_sqlite_distribution(
 }
 
 fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> Result<(u64, u64)> {
+    ensure_sqlite_exists(sqlite_path)?;
     let mut connection = Connection::open(sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
     connection.busy_timeout(Duration::from_secs(5))?;
 
-    let total_rows: u64 =
-        connection.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let total_rows: u64 =
+        transaction.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
     let changed_rows = transaction.execute(
         "UPDATE threads SET model_provider = ?1 WHERE model_provider <> ?1",
         [provider],
@@ -592,19 +636,71 @@ fn reconcile_sqlite_with_backup(sqlite_path: &Path, provider: &str) -> Result<(u
     create_sqlite_backup(sqlite_path, &backup_temp_path)?;
     std::fs::rename(&backup_temp_path, &backup_path)
         .with_context(|| format!("failed to finalize {}", backup_path.display()))?;
+    sync_dir(&backups_dir)?;
 
     let (changed_rows, total_rows) = reconcile_sqlite_in_place(sqlite_path, provider)?;
     Ok((changed_rows, total_rows, backup_path))
 }
 
 fn create_sqlite_backup(sqlite_path: &Path, backup_path: &Path) -> Result<()> {
+    ensure_sqlite_exists(sqlite_path)?;
     let source = Connection::open(sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
-    source.busy_timeout(Duration::from_secs(5))?;
+    source.busy_timeout(Duration::from_millis(5_000))?;
     let mut destination = Connection::open(backup_path)
         .with_context(|| format!("failed to open {}", backup_path.display()))?;
     let backup = Backup::new(&source, &mut destination)?;
-    backup.step(-1)?;
+    let started = Instant::now();
+    let timeout = Duration::from_secs(30);
+
+    loop {
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "sqlite backup timed out after {} seconds for {}",
+                timeout.as_secs(),
+                sqlite_path.display()
+            );
+        }
+
+        match backup.step(100)? {
+            StepResult::Done => break,
+            StepResult::More => {}
+            StepResult::Busy | StepResult::Locked => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {}
+        }
+    }
+
+    drop(backup);
+    drop(destination);
+    sync_file(backup_path)?;
+
+    Ok(())
+}
+
+fn ensure_sqlite_exists(sqlite_path: &Path) -> Result<()> {
+    if sqlite_path.exists() {
+        return Ok(());
+    }
+
+    anyhow::bail!(sqlite_missing_error(detect_locale(), sqlite_path));
+}
+
+fn sync_file(path: &Path) -> Result<()> {
+    let file = File::open(path).with_context(|| format!("open for sync: {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("fsync: {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    sync_file(path)
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -827,6 +923,13 @@ fn provider_help(locale: Locale) -> &'static str {
     }
 }
 
+fn provider_empty_error(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "provider must contain at least one non-whitespace character",
+        Locale::ZhHans => "provider 需要包含至少一个非空白字符",
+    }
+}
+
 fn help_option_help(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Print help",
@@ -960,6 +1063,13 @@ fn watcher_disconnected_error(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "watcher disconnected",
         Locale::ZhHans => "监听器已断开",
+    }
+}
+
+fn watch_already_running_error(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "another watch is already running for this codex home",
+        Locale::ZhHans => "这个 codex home 已经有另一个 watch 在运行",
     }
 }
 
@@ -1117,6 +1227,19 @@ fn no_launchd_plist_message(locale: Locale, path: &Path) -> String {
     }
 }
 
+fn sqlite_missing_error(locale: Locale, path: &Path) -> String {
+    match locale {
+        Locale::En => format!(
+            "database not found at {} — run Codex at least once to create it",
+            path.display()
+        ),
+        Locale::ZhHans => format!(
+            "未找到数据库 {} — 请先运行一次 Codex 以生成它",
+            path.display()
+        ),
+    }
+}
+
 fn status_title(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Codex Threadripper",
@@ -1249,8 +1372,10 @@ mod tests {
     use super::parse_apple_languages;
     use super::parse_locale_tag;
     use super::read_provider_from_config;
+    use super::reconcile_once;
     use super::reconcile_sqlite_in_place;
     use super::reconcile_sqlite_with_backup;
+    use super::validate_provider_override;
     use crate::service::ServiceManager;
     use anyhow::Result;
     use clap::FromArgMatches;
@@ -1347,6 +1472,33 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let provider = read_provider_from_config(dir.path())?;
         assert_eq!(provider, "openai");
+        Ok(())
+    }
+
+    #[test]
+    fn defaults_to_openai_with_blank_provider_in_config() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(dir.path().join("config.toml"), "model_provider = \"   \"\n")?;
+        let provider = read_provider_from_config(dir.path())?;
+        assert_eq!(provider, "openai");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_blank_provider_override() {
+        let err = validate_provider_override(Locale::En, Some("   ")).unwrap_err();
+        assert!(err.to_string().contains("provider must contain"));
+    }
+
+    #[test]
+    fn reconcile_once_returns_error_when_db_missing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sqlite_path = dir.path().join("state_5.sqlite");
+
+        let err = reconcile_once(dir.path(), Some("openai")).unwrap_err();
+
+        assert!(err.to_string().contains(&sqlite_path.display().to_string()));
+        assert!(!sqlite_path.exists());
         Ok(())
     }
 

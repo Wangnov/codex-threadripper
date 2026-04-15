@@ -58,9 +58,10 @@ pub fn current_manager() -> ServiceManager {
 
 pub fn current_service_status() -> Result<ServiceStatus> {
     let manager = current_manager();
+    let codex_home = current_codex_home()?;
     let config_path = service_config_path(manager)?;
     let installed = config_path.exists();
-    let running = service_running(manager)?;
+    let running = service_running(manager, &codex_home)?;
     Ok(ServiceStatus {
         manager,
         config_path,
@@ -76,7 +77,7 @@ pub fn install_service(
     poll_interval: Duration,
 ) -> Result<ServiceInstallSummary> {
     let manager = current_manager();
-    stop_detached_watch_if_present()?;
+    stop_detached_watch_if_present(codex_home)?;
 
     match manager {
         ServiceManager::Launchd => {
@@ -93,7 +94,8 @@ pub fn install_service(
 
 pub fn uninstall_service() -> Result<PathBuf> {
     let manager = current_manager();
-    stop_detached_watch_if_present()?;
+    let codex_home = current_codex_home()?;
+    stop_detached_watch_if_present(&codex_home)?;
 
     let config_path = service_config_path(manager)?;
     match manager {
@@ -139,10 +141,12 @@ pub fn manager_name(manager: ServiceManager) -> &'static str {
 }
 
 pub fn log_path() -> Result<PathBuf> {
-    let logs_dir = logs_dir()?;
-    std::fs::create_dir_all(&logs_dir)
-        .with_context(|| format!("failed to create {}", logs_dir.display()))?;
-    Ok(logs_dir.join("codex-threadripper.log"))
+    let codex_home = current_codex_home()?;
+    log_path_for(&codex_home)
+}
+
+fn log_path_for(codex_home: &Path) -> Result<PathBuf> {
+    Ok(logs_dir(codex_home)?.join("codex-threadripper.log"))
 }
 
 pub fn current_service_inspect_command() -> Result<Option<String>> {
@@ -194,7 +198,7 @@ fn install_launchd(
     Ok(ServiceInstallSummary {
         manager: ServiceManager::Launchd,
         config_path: plist_path,
-        log_path: log_path()?,
+        log_path: log_path_for(codex_home)?,
     })
 }
 
@@ -250,7 +254,7 @@ fn install_systemd_user(
     Ok(ServiceInstallSummary {
         manager: ServiceManager::SystemdUser,
         config_path,
-        log_path: log_path()?,
+        log_path: log_path_for(codex_home)?,
     })
 }
 
@@ -302,7 +306,7 @@ fn install_windows_startup(
     Ok(ServiceInstallSummary {
         manager: ServiceManager::WindowsStartup,
         config_path,
-        log_path: log_path()?,
+        log_path: log_path_for(codex_home)?,
     })
 }
 
@@ -314,16 +318,16 @@ fn uninstall_windows_startup(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn service_running(manager: ServiceManager) -> Result<bool> {
+fn service_running(manager: ServiceManager, codex_home: &Path) -> Result<bool> {
     match manager {
         ServiceManager::Launchd => launchd_service_loaded(),
         ServiceManager::SystemdUser => {
             if systemd_user_unit_active()? {
                 return Ok(true);
             }
-            detached_watch_running()
+            detached_watch_running(codex_home)
         }
-        ServiceManager::WindowsStartup => detached_watch_running(),
+        ServiceManager::WindowsStartup => detached_watch_running(codex_home),
     }
 }
 
@@ -412,9 +416,10 @@ pub fn build_launchd_plist(
     provider_override: Option<&str>,
     poll_interval: Duration,
 ) -> String {
-    let stdout_path = log_path().unwrap_or_else(|_| PathBuf::from("/tmp/codex-threadripper.log"));
-    let stderr_path =
-        stderr_log_path().unwrap_or_else(|_| PathBuf::from("/tmp/codex-threadripper.error.log"));
+    let stdout_path =
+        log_path_for(codex_home).unwrap_or_else(|_| PathBuf::from("/tmp/codex-threadripper.log"));
+    let stderr_path = stderr_log_path_for(codex_home)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/codex-threadripper.error.log"));
 
     let mut arguments = vec![
         xml_escape(exe_path.to_string_lossy().as_ref()),
@@ -474,7 +479,7 @@ fn watch_command_line(
 ) -> String {
     let quote = |value: String| match flavor {
         ShellFlavor::Sh => shell_quote(value),
-        ShellFlavor::Cmd => windows_quote(value),
+        ShellFlavor::Cmd => windows_quote(&value),
     };
 
     let mut parts = vec![
@@ -504,8 +509,8 @@ fn start_detached_watch(
     provider_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<()> {
-    let stdout_path = log_path()?;
-    let stderr_path = stderr_log_path()?;
+    let stdout_path = log_path_for(codex_home)?;
+    let stderr_path = stderr_log_path_for(codex_home)?;
     if let Some(parent) = stdout_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -522,19 +527,19 @@ fn start_detached_watch(
         .with_context(|| format!("failed to open {}", stderr_path.display()))?;
 
     let mut command = ProcessCommand::new(exe_path);
+    command.arg("--codex-home").arg(codex_home);
+
+    if let Some(provider) = provider_override {
+        command.arg("--provider").arg(provider);
+    }
+
     command
-        .arg("--codex-home")
-        .arg(codex_home)
         .arg("watch")
         .arg("--poll-interval-ms")
         .arg(poll_interval.as_millis().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-
-    if let Some(provider) = provider_override {
-        command.arg("--provider").arg(provider);
-    }
 
     #[cfg(target_os = "windows")]
     {
@@ -546,61 +551,84 @@ fn start_detached_watch(
     let child = command
         .spawn()
         .context("failed to start detached watch process")?;
-    write_pid_file(child.id())?;
+    write_pid_file(child.id(), codex_home)?;
     Ok(())
 }
 
-fn stop_detached_watch_if_present() -> Result<()> {
-    let Some(pid) = read_pid_file()? else {
+fn stop_detached_watch_if_present(codex_home: &Path) -> Result<()> {
+    let Some(pid_file) = read_pid_file(codex_home)? else {
         return Ok(());
     };
-    stop_process(pid)?;
-    remove_pid_file_if_exists()?;
+    match process_is_running(pid_file.pid, pid_file.exe_path.as_deref())? {
+        ProcessStatus::Running => {
+            stop_process(pid_file.pid)?;
+            remove_pid_file_if_exists(codex_home)?;
+        }
+        ProcessStatus::NotRunning => {
+            remove_pid_file_if_exists(codex_home)?;
+        }
+        ProcessStatus::RunningMismatched => {}
+    }
     Ok(())
 }
 
-fn detached_watch_running() -> Result<bool> {
-    let Some(pid) = read_pid_file()? else {
+fn detached_watch_running(codex_home: &Path) -> Result<bool> {
+    let Some(pid_file) = read_pid_file(codex_home)? else {
         return Ok(false);
     };
-    if process_is_running(pid)? {
-        return Ok(true);
+    match process_is_running(pid_file.pid, pid_file.exe_path.as_deref())? {
+        ProcessStatus::Running => Ok(true),
+        ProcessStatus::NotRunning => {
+            remove_pid_file_if_exists(codex_home)?;
+            Ok(false)
+        }
+        ProcessStatus::RunningMismatched => Ok(false),
     }
-    remove_pid_file_if_exists()?;
-    Ok(false)
 }
 
-fn pid_file_path() -> Result<PathBuf> {
-    Ok(runtime_dir()?.join("watch.pid"))
+fn pid_file_path(codex_home: &Path) -> Result<PathBuf> {
+    Ok(runtime_dir(codex_home)?.join("watch.pid"))
 }
 
-fn write_pid_file(pid: u32) -> Result<()> {
-    let pid_path = pid_file_path()?;
+fn write_pid_file(pid: u32, codex_home: &Path) -> Result<()> {
+    let pid_path = pid_file_path(codex_home)?;
     if let Some(parent) = pid_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&pid_path, format!("{pid}\n"))
+    let exe_path = std::env::current_exe()
+        .context("failed to read current executable for pid file")?
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(&pid_path, format!("{pid}\n{exe_path}\n"))
         .with_context(|| format!("failed to write {}", pid_path.display()))?;
     Ok(())
 }
 
-fn read_pid_file() -> Result<Option<u32>> {
-    let pid_path = pid_file_path()?;
+fn read_pid_file(codex_home: &Path) -> Result<Option<PidFile>> {
+    let pid_path = pid_file_path(codex_home)?;
     if !pid_path.exists() {
         return Ok(None);
     }
     let raw = std::fs::read_to_string(&pid_path)
         .with_context(|| format!("failed to read {}", pid_path.display()))?;
-    let pid = raw
+    let mut lines = raw.lines();
+    let pid = lines
+        .next()
+        .context("pid file is empty")?
         .trim()
         .parse::<u32>()
         .context("failed to parse pid file")?;
-    Ok(Some(pid))
+    let exe_path = lines
+        .next()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from);
+    Ok(Some(PidFile { pid, exe_path }))
 }
 
-fn remove_pid_file_if_exists() -> Result<()> {
-    let pid_path = pid_file_path()?;
+fn remove_pid_file_if_exists(codex_home: &Path) -> Result<()> {
+    let pid_path = pid_file_path(codex_home)?;
     if pid_path.exists() {
         std::fs::remove_file(&pid_path)
             .with_context(|| format!("failed to remove {}", pid_path.display()))?;
@@ -608,7 +636,7 @@ fn remove_pid_file_if_exists() -> Result<()> {
     Ok(())
 }
 
-fn process_is_running(pid: u32) -> Result<bool> {
+fn process_is_running(pid: u32, expected_exe: Option<&Path>) -> Result<ProcessStatus> {
     #[cfg(target_os = "windows")]
     {
         let filter = format!("PID eq {pid}");
@@ -616,18 +644,63 @@ fn process_is_running(pid: u32) -> Result<bool> {
             .args(["/FI", filter.as_str(), "/FO", "CSV", "/NH"])
             .output()?;
         if !output.status.success() {
-            return Ok(false);
+            return Ok(ProcessStatus::NotRunning);
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.contains(&format!(",\"{pid}\"")) || stdout.contains(&format!(",{pid},")))
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() || trimmed.starts_with("INFO:") {
+            return Ok(ProcessStatus::NotRunning);
+        }
+        if trimmed.to_ascii_lowercase().contains("codex-threadripper") {
+            return Ok(ProcessStatus::Running);
+        }
+        let _ = expected_exe;
+        Ok(ProcessStatus::RunningMismatched)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
         let status = ProcessCommand::new("kill")
             .arg("-0")
             .arg(pid.to_string())
             .status()?;
-        Ok(status.success())
+        if !status.success() {
+            return Ok(ProcessStatus::NotRunning);
+        }
+        let output = ProcessCommand::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()?;
+        if !output.status.success() {
+            return Ok(ProcessStatus::NotRunning);
+        }
+        if String::from_utf8_lossy(&output.stdout)
+            .to_ascii_lowercase()
+            .contains("codex-threadripper")
+        {
+            return Ok(ProcessStatus::Running);
+        }
+        let _ = expected_exe;
+        Ok(ProcessStatus::RunningMismatched)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = ProcessCommand::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()?;
+        if !status.success() {
+            return Ok(ProcessStatus::NotRunning);
+        }
+        let Some(expected_exe) = expected_exe else {
+            return Ok(ProcessStatus::Running);
+        };
+        let actual_exe = match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(path) => path,
+            Err(_) => return Ok(ProcessStatus::NotRunning),
+        };
+        if executable_paths_match(&actual_exe, expected_exe) {
+            return Ok(ProcessStatus::Running);
+        }
+        Ok(ProcessStatus::RunningMismatched)
     }
 }
 
@@ -689,40 +762,98 @@ fn systemd_user_unit_active() -> Result<bool> {
     Ok(output.status.success())
 }
 
-fn stderr_log_path() -> Result<PathBuf> {
-    Ok(log_path()?
+fn stderr_log_path_for(codex_home: &Path) -> Result<PathBuf> {
+    Ok(log_path_for(codex_home)?
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("codex-threadripper.error.log"))
 }
 
-fn runtime_dir() -> Result<PathBuf> {
+fn runtime_dir(codex_home: &Path) -> Result<PathBuf> {
+    let tag = codex_home_tag(codex_home);
     #[cfg(target_os = "macos")]
     {
-        return Ok(home_dir()?.join("Library/Application Support/codex-threadripper"));
+        return Ok(home_dir()?
+            .join("Library/Application Support/codex-threadripper")
+            .join(tag));
     }
     #[cfg(target_os = "linux")]
     {
-        return Ok(home_dir()?.join(".local/state/codex-threadripper"));
+        return Ok(home_dir()?
+            .join(".local/state/codex-threadripper")
+            .join(tag));
     }
     #[cfg(target_os = "windows")]
     {
-        return Ok(windows_local_app_data_dir()?.join("codex-threadripper"));
+        return Ok(windows_local_app_data_dir()?
+            .join("codex-threadripper")
+            .join(tag));
     }
 }
 
-fn logs_dir() -> Result<PathBuf> {
+fn logs_dir(codex_home: &Path) -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        return Ok(home_dir()?.join("Library/Logs"));
+        let tag = codex_home_tag(codex_home);
+        return Ok(home_dir()?
+            .join("Library/Logs/codex-threadripper")
+            .join(tag));
     }
     #[cfg(target_os = "linux")]
     {
-        return Ok(runtime_dir()?);
+        return Ok(runtime_dir(codex_home)?.join("logs"));
     }
     #[cfg(target_os = "windows")]
     {
-        return Ok(runtime_dir()?);
+        return Ok(runtime_dir(codex_home)?.join("logs"));
+    }
+}
+
+fn current_codex_home() -> Result<PathBuf> {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == std::ffi::OsStr::new("--codex-home") {
+            if let Some(path) = iter.next() {
+                return Ok(PathBuf::from(path));
+            }
+            anyhow::bail!("--codex-home requires a path");
+        }
+        let arg_str = arg.to_string_lossy();
+        if let Some(path) = arg_str.strip_prefix("--codex-home=") {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    if let Some(path) = std::env::var_os("CODEX_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(default_codex_home())
+}
+
+fn codex_home_tag(codex_home: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    codex_home.display().to_string().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn default_codex_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
+}
+
+#[cfg(target_os = "linux")]
+fn executable_paths_match(actual: &Path, expected: &Path) -> bool {
+    if actual == expected {
+        return true;
+    }
+    match std::fs::canonicalize(expected) {
+        Ok(expected_canonical) => actual == expected_canonical,
+        Err(_) => false,
     }
 }
 
@@ -774,12 +905,8 @@ fn launchctl_service_target() -> Result<String> {
 }
 
 fn current_uid() -> Result<u32> {
-    let output = ProcessCommand::new("id").arg("-u").output()?;
-    if !output.status.success() {
-        anyhow::bail!("failed to read current uid with `id -u`");
-    }
-    let uid = String::from_utf8(output.stdout)?.trim().parse::<u32>()?;
-    Ok(uid)
+    // SAFETY: geteuid reads the effective uid for the current process.
+    Ok(unsafe { libc::geteuid() })
 }
 
 fn launchd_service_loaded() -> Result<bool> {
@@ -833,14 +960,17 @@ fn shell_quote(input: String) -> String {
     format!("'{}'", input.replace('\'', r"'\''"))
 }
 
-fn windows_quote(input: String) -> String {
-    if input
+fn windows_quote(input: &str) -> String {
+    let escaped: String = input
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '\\' | '/' | '.' | '_' | '-'))
-    {
-        return input;
-    }
-    format!("\"{}\"", input.replace('"', "\"\""))
+        .flat_map(|c| match c {
+            '"' => "\"\"".chars().collect::<Vec<_>>(),
+            '%' => "%%".chars().collect::<Vec<_>>(),
+            '^' | '&' | '|' | '<' | '>' => vec!['^', c],
+            _ => vec![c],
+        })
+        .collect();
+    format!("\"{escaped}\"")
 }
 
 fn xml_escape(input: &str) -> String {
@@ -865,4 +995,35 @@ fn make_executable(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[derive(Debug)]
+struct PidFile {
+    pid: u32,
+    exe_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessStatus {
+    Running,
+    RunningMismatched,
+    NotRunning,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows_quote;
+
+    #[test]
+    fn windows_quote_escapes_shell_metacharacters() {
+        assert_eq!(
+            windows_quote(r"C:\Program Files\x.exe"),
+            r#""C:\Program Files\x.exe""#
+        );
+        assert_eq!(
+            windows_quote(r"C:\tmp\100% done\x.exe"),
+            r#""C:\tmp\100%% done\x.exe""#
+        );
+        assert_eq!(windows_quote(r"C:\tmp\a&b\x.exe"), r#""C:\tmp\a^&b\x.exe""#);
+    }
 }
