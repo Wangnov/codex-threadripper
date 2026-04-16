@@ -451,14 +451,21 @@ fn run_watch(
         watcher.watch(parent, RecursiveMode::NonRecursive)?;
     }
 
-    let initial = reconcile_once(codex_home, provider_override.as_deref())?;
-    print_sync_summary(locale, watch_started_title(locale), &initial);
+    let mut last_provider = None;
+    match reconcile_once(codex_home, provider_override.as_deref()) {
+        Ok(summary) => {
+            print_sync_summary(locale, watch_started_title(locale), &summary);
+            last_provider = Some(summary.provider.clone());
+        }
+        Err(err) => {
+            eprintln!("{}", watch_initial_reconcile_error_message(locale, &err));
+        }
+    }
     println!(
         "{}",
         watch_running_message(locale, codex_home, poll_interval)
     );
 
-    let mut last_provider = initial.provider.clone();
     let mut next_poll_deadline = Instant::now() + poll_interval;
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -468,13 +475,15 @@ fn run_watch(
                 if touches_config_file(&event, &config_path) {
                     match reconcile_once(codex_home, provider_override.as_deref()) {
                         Ok(summary) => {
-                            if summary.provider != last_provider || summary.changed_rows > 0 {
+                            if last_provider.as_deref() != Some(summary.provider.as_str())
+                                || summary.changed_rows > 0
+                            {
                                 print_sync_summary(locale, config_change_title(locale), &summary);
                             }
-                            last_provider = summary.provider;
+                            last_provider = Some(summary.provider.clone());
                         }
                         Err(err) => {
-                            eprintln!("[watch] reconcile skipped: {err:#}");
+                            eprintln!("{}", watch_reconcile_skipped_message(locale, &err));
                         }
                     }
                     next_poll_deadline = Instant::now() + poll_interval;
@@ -486,17 +495,19 @@ fn run_watch(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 match reconcile_once(codex_home, provider_override.as_deref()) {
                     Ok(summary) => {
-                        if summary.provider != last_provider || summary.changed_rows > 0 {
+                        if last_provider.as_deref() != Some(summary.provider.as_str())
+                            || summary.changed_rows > 0
+                        {
                             print_sync_summary(
                                 locale,
                                 background_reconcile_title(locale),
                                 &summary,
                             );
                         }
-                        last_provider = summary.provider;
+                        last_provider = Some(summary.provider.clone());
                     }
                     Err(err) => {
-                        eprintln!("[watch] reconcile skipped: {err:#}");
+                        eprintln!("{}", watch_reconcile_skipped_message(locale, &err));
                     }
                 }
                 next_poll_deadline = Instant::now() + poll_interval;
@@ -1076,6 +1087,24 @@ fn watch_running_message(locale: Locale, codex_home: &Path, poll_interval: Durat
             codex_home.display(),
             poll_interval.as_millis()
         ),
+    }
+}
+
+fn watch_initial_reconcile_error_message(locale: Locale, err: &anyhow::Error) -> String {
+    match locale {
+        Locale::En => format!(
+            "Initial reconcile hit an error. Watch will keep running and retry on config changes or the next poll: {err:#}"
+        ),
+        Locale::ZhHans => {
+            format!("首轮收敛遇到错误。watch 会继续运行，并在配置变更或下一次轮询时重试：{err:#}")
+        }
+    }
+}
+
+fn watch_reconcile_skipped_message(locale: Locale, err: &anyhow::Error) -> String {
+    match locale {
+        Locale::En => format!("Reconcile is waiting for the next retry: {err:#}"),
+        Locale::ZhHans => format!("本轮收敛等待下一次重试：{err:#}"),
     }
 }
 
