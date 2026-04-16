@@ -12,9 +12,9 @@
   <a href="https://github.com/Wangnov/codex-threadripper/releases/latest"><img src="https://img.shields.io/github/v/release/Wangnov/codex-threadripper?logo=github" alt="Latest release"></a>
   <a href="https://crates.io/crates/codex-threadripper"><img src="https://img.shields.io/crates/v/codex-threadripper?logo=rust" alt="Crates.io"></a>
   <a href="https://www.npmjs.com/package/codex-threadripper"><img src="https://img.shields.io/npm/v/codex-threadripper?logo=npm" alt="npm"></a>
-  <a href="https://github.com/Wangnov/codex-threadripper/actions/workflows/release-candidate.yml"><img src="https://github.com/Wangnov/codex-threadripper/actions/workflows/release-candidate.yml/badge.svg" alt="Release candidate"></a>
-  <a href="https://github.com/Wangnov/codex-threadripper/actions/workflows/release.yml"><img src="https://github.com/Wangnov/codex-threadripper/actions/workflows/release.yml/badge.svg" alt="Release"></a>
-  <a href="https://github.com/Wangnov/codex-threadripper/actions/workflows/npm-publish.yml"><img src="https://github.com/Wangnov/codex-threadripper/actions/workflows/npm-publish.yml/badge.svg" alt="npm publish"></a>
+  <a href="https://github.com/Wangnov/codex-threadripper/actions/workflows/release-candidate.yml"><img src="https://img.shields.io/badge/release%20candidate-manual%20gate-0969da" alt="Release candidate gate"></a>
+  <a href="https://github.com/Wangnov/codex-threadripper/actions/workflows/release.yml"><img src="https://img.shields.io/badge/release-automated-2ea44f" alt="Release automation"></a>
+  <a href="https://github.com/Wangnov/codex-threadripper/actions/workflows/npm-publish.yml"><img src="https://img.shields.io/badge/npm%20publish-automated-2ea44f" alt="npm publish automation"></a>
   <a href="https://github.com/Wangnov/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-wangnov%2Ftap-FBB040?logo=homebrew" alt="Homebrew tap"></a>
   <a href="https://github.com/Wangnov/codex-threadripper/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-MIT-2ea44f" alt="MIT license"></a>
 </p>
