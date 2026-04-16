@@ -17,6 +17,7 @@ use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use rusqlite::backup::StepResult;
 use serde::Deserialize;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -141,6 +142,7 @@ struct StatusSummary {
 fn main() -> Result<()> {
     let locale = detect_locale();
     let cli = parse_cli(locale)?;
+    validate_provider_override(locale, cli.provider.as_deref())?;
     let codex_home = cli.codex_home.unwrap_or_else(default_codex_home);
 
     match cli.command {
@@ -187,16 +189,41 @@ fn main() -> Result<()> {
 }
 
 fn parse_cli(locale: Locale) -> Result<Cli> {
+    validate_provider_override_args(locale, std::env::args_os())?;
     let command = localized_command(locale);
     let matches = command.clone().get_matches();
-    let cli = Cli::from_arg_matches(&matches).map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    validate_provider_override(locale, cli.provider.as_deref())?;
-    Ok(cli)
+    Cli::from_arg_matches(&matches).map_err(|err| anyhow::anyhow!(err.to_string()))
 }
 
 fn validate_provider_override(locale: Locale, provider: Option<&str>) -> Result<()> {
     if provider.is_some_and(|value| value.trim().is_empty()) {
         anyhow::bail!(provider_empty_error(locale));
+    }
+    Ok(())
+}
+
+fn validate_provider_override_args<I, T>(locale: Locale, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<OsStr>,
+{
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
+        if arg == OsStr::new("--") {
+            break;
+        }
+        if arg == OsStr::new("--provider") {
+            if let Some(value) = args.next() {
+                validate_provider_override(locale, value.as_ref().to_str())?;
+            }
+            continue;
+        }
+
+        let rendered = arg.to_string_lossy();
+        if let Some(value) = rendered.strip_prefix("--provider=") {
+            validate_provider_override(locale, Some(value))?;
+        }
     }
     Ok(())
 }
@@ -1376,6 +1403,7 @@ mod tests {
     use super::reconcile_sqlite_in_place;
     use super::reconcile_sqlite_with_backup;
     use super::validate_provider_override;
+    use super::validate_provider_override_args;
     use crate::service::ServiceManager;
     use anyhow::Result;
     use clap::FromArgMatches;
@@ -1487,6 +1515,16 @@ mod tests {
     #[test]
     fn rejects_blank_provider_override() {
         let err = validate_provider_override(Locale::En, Some("   ")).unwrap_err();
+        assert!(err.to_string().contains("provider must contain"));
+    }
+
+    #[test]
+    fn rejects_blank_provider_override_in_cli_args_before_help_short_circuit() {
+        let err = validate_provider_override_args(
+            Locale::En,
+            ["codex-threadripper", "--provider", "", "status", "--help"],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("provider must contain"));
     }
 
