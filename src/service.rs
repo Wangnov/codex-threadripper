@@ -904,9 +904,15 @@ fn launchctl_service_target() -> Result<String> {
     Ok(format!("{}/{}", launchctl_domain()?, SERVICE_LABEL))
 }
 
+#[cfg(unix)]
 fn current_uid() -> Result<u32> {
     // SAFETY: geteuid reads the effective uid for the current process.
     Ok(unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> Result<u32> {
+    anyhow::bail!("current uid is unavailable on this platform")
 }
 
 fn launchd_service_loaded() -> Result<bool> {
