@@ -1,6 +1,6 @@
 [package]
 name = "codex-threadripper"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 authors = ["Wangnov"]
 description = "Human-first CLI that keeps Codex thread history aligned to one provider bucket."
