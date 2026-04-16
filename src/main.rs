@@ -17,6 +17,7 @@ use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use rusqlite::backup::StepResult;
 use serde::Deserialize;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -141,6 +142,7 @@ struct StatusSummary {
 fn main() -> Result<()> {
     let locale = detect_locale();
     let cli = parse_cli(locale)?;
+    validate_provider_override(locale, cli.provider.as_deref())?;
     let codex_home = cli.codex_home.unwrap_or_else(default_codex_home);
 
     match cli.command {
@@ -187,16 +189,41 @@ fn main() -> Result<()> {
 }
 
 fn parse_cli(locale: Locale) -> Result<Cli> {
+    validate_provider_override_args(locale, std::env::args_os())?;
     let command = localized_command(locale);
     let matches = command.clone().get_matches();
-    let cli = Cli::from_arg_matches(&matches).map_err(|err| anyhow::anyhow!(err.to_string()))?;
-    validate_provider_override(locale, cli.provider.as_deref())?;
-    Ok(cli)
+    Cli::from_arg_matches(&matches).map_err(|err| anyhow::anyhow!(err.to_string()))
 }
 
 fn validate_provider_override(locale: Locale, provider: Option<&str>) -> Result<()> {
     if provider.is_some_and(|value| value.trim().is_empty()) {
         anyhow::bail!(provider_empty_error(locale));
+    }
+    Ok(())
+}
+
+fn validate_provider_override_args<I, T>(locale: Locale, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<OsStr>,
+{
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        let arg = arg.as_ref();
+        if arg == OsStr::new("--") {
+            break;
+        }
+        if arg == OsStr::new("--provider") {
+            if let Some(value) = args.next() {
+                validate_provider_override(locale, value.as_ref().to_str())?;
+            }
+            continue;
+        }
+
+        let rendered = arg.to_string_lossy();
+        if let Some(value) = rendered.strip_prefix("--provider=") {
+            validate_provider_override(locale, Some(value))?;
+        }
     }
     Ok(())
 }
@@ -424,14 +451,21 @@ fn run_watch(
         watcher.watch(parent, RecursiveMode::NonRecursive)?;
     }
 
-    let initial = reconcile_once(codex_home, provider_override.as_deref())?;
-    print_sync_summary(locale, watch_started_title(locale), &initial);
+    let mut last_provider = None;
+    match reconcile_once(codex_home, provider_override.as_deref()) {
+        Ok(summary) => {
+            print_sync_summary(locale, watch_started_title(locale), &summary);
+            last_provider = Some(summary.provider.clone());
+        }
+        Err(err) => {
+            eprintln!("{}", watch_initial_reconcile_error_message(locale, &err));
+        }
+    }
     println!(
         "{}",
         watch_running_message(locale, codex_home, poll_interval)
     );
 
-    let mut last_provider = initial.provider.clone();
     let mut next_poll_deadline = Instant::now() + poll_interval;
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -441,13 +475,15 @@ fn run_watch(
                 if touches_config_file(&event, &config_path) {
                     match reconcile_once(codex_home, provider_override.as_deref()) {
                         Ok(summary) => {
-                            if summary.provider != last_provider || summary.changed_rows > 0 {
+                            if last_provider.as_deref() != Some(summary.provider.as_str())
+                                || summary.changed_rows > 0
+                            {
                                 print_sync_summary(locale, config_change_title(locale), &summary);
                             }
-                            last_provider = summary.provider;
+                            last_provider = Some(summary.provider.clone());
                         }
                         Err(err) => {
-                            eprintln!("[watch] reconcile skipped: {err:#}");
+                            eprintln!("{}", watch_reconcile_skipped_message(locale, &err));
                         }
                     }
                     next_poll_deadline = Instant::now() + poll_interval;
@@ -459,17 +495,19 @@ fn run_watch(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 match reconcile_once(codex_home, provider_override.as_deref()) {
                     Ok(summary) => {
-                        if summary.provider != last_provider || summary.changed_rows > 0 {
+                        if last_provider.as_deref() != Some(summary.provider.as_str())
+                            || summary.changed_rows > 0
+                        {
                             print_sync_summary(
                                 locale,
                                 background_reconcile_title(locale),
                                 &summary,
                             );
                         }
-                        last_provider = summary.provider;
+                        last_provider = Some(summary.provider.clone());
                     }
                     Err(err) => {
-                        eprintln!("[watch] reconcile skipped: {err:#}");
+                        eprintln!("{}", watch_reconcile_skipped_message(locale, &err));
                     }
                 }
                 next_poll_deadline = Instant::now() + poll_interval;
@@ -573,6 +611,7 @@ fn inspect_sqlite_distribution(
     sqlite_path: &Path,
     target_provider: &str,
 ) -> Result<(u64, u64, Vec<(String, u64)>)> {
+    ensure_sqlite_exists(sqlite_path)?;
     let connection = Connection::open(sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
     let total_rows: u64 =
@@ -1052,6 +1091,24 @@ fn watch_running_message(locale: Locale, codex_home: &Path, poll_interval: Durat
     }
 }
 
+fn watch_initial_reconcile_error_message(locale: Locale, err: &anyhow::Error) -> String {
+    match locale {
+        Locale::En => format!(
+            "Initial reconcile hit an error. Watch will keep running and retry on config changes or the next poll: {err:#}"
+        ),
+        Locale::ZhHans => {
+            format!("首轮收敛遇到错误。watch 会继续运行，并在配置变更或下一次轮询时重试：{err:#}")
+        }
+    }
+}
+
+fn watch_reconcile_skipped_message(locale: Locale, err: &anyhow::Error) -> String {
+    match locale {
+        Locale::En => format!("Reconcile is waiting for the next retry: {err:#}"),
+        Locale::ZhHans => format!("本轮收敛等待下一次重试：{err:#}"),
+    }
+}
+
 fn watcher_error_message(locale: Locale, err: notify::Error) -> String {
     match locale {
         Locale::En => format!("Watcher error: {err}"),
@@ -1367,6 +1424,7 @@ mod tests {
     use super::DEFAULT_POLL_INTERVAL_MS;
     use super::Locale;
     use super::detect_locale_from_sources;
+    use super::inspect_sqlite_distribution;
     use super::install_next_steps;
     use super::localized_command;
     use super::parse_apple_languages;
@@ -1376,6 +1434,7 @@ mod tests {
     use super::reconcile_sqlite_in_place;
     use super::reconcile_sqlite_with_backup;
     use super::validate_provider_override;
+    use super::validate_provider_override_args;
     use crate::service::ServiceManager;
     use anyhow::Result;
     use clap::FromArgMatches;
@@ -1491,6 +1550,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_blank_provider_override_in_cli_args_before_help_short_circuit() {
+        let err = validate_provider_override_args(
+            Locale::En,
+            ["codex-threadripper", "--provider", "", "status", "--help"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("provider must contain"));
+    }
+
+    #[test]
     fn reconcile_once_returns_error_when_db_missing() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let sqlite_path = dir.path().join("state_5.sqlite");
@@ -1499,6 +1568,20 @@ mod tests {
 
         assert!(err.to_string().contains(&sqlite_path.display().to_string()));
         assert!(!sqlite_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_sqlite_distribution_returns_error_when_db_missing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sqlite_path = dir.path().join("state_5.sqlite");
+        let backups_path = dir.path().join("backups");
+
+        let err = inspect_sqlite_distribution(&sqlite_path, "openai").unwrap_err();
+
+        assert!(err.to_string().contains(&sqlite_path.display().to_string()));
+        assert!(!sqlite_path.exists());
+        assert!(!backups_path.exists());
         Ok(())
     }
 
