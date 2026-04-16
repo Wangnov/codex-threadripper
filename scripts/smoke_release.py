@@ -43,6 +43,8 @@ CREATE TABLE threads (
 );
 """
 
+COMMAND_TIMEOUT_SECONDS = 30
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -65,24 +67,36 @@ def main() -> int:
             )
         else:
             binary_path = pathlib.Path(args.binary).resolve()
+        print(f"[smoke] using binary: {binary_path}")
         prepare_codex_home(codex_home)
+        print("[smoke] prepared codex home")
         assert_status(binary_path, codex_home, expected_total=3, expected_mismatched=2)
+        print("[smoke] initial status passed")
         backup_path = run_sync(binary_path, codex_home)
+        print(f"[smoke] sync passed with backup: {backup_path}")
         assert_backup_contains_dirty_rows(backup_path)
+        print("[smoke] backup verification passed")
         assert_status(binary_path, codex_home, expected_total=3, expected_mismatched=0)
+        print("[smoke] post-sync status passed")
         run_service_install(binary_path, codex_home)
+        print("[smoke] install-service passed")
         try:
             wait_for_service_status(
                 binary_path, codex_home, expected_installed="yes", expected_running="yes"
             )
+            print("[smoke] service reached installed=yes running=yes")
             insert_dirty_row(codex_home / "state_5.sqlite")
             write_new_session(codex_home)
+            print("[smoke] inserted dirty row and wrote new session")
             wait_for_reconcile(binary_path, codex_home)
+            print("[smoke] background reconcile passed")
         finally:
             run_service_uninstall(binary_path, codex_home)
+            print("[smoke] uninstall-service passed")
             wait_for_service_status(
                 binary_path, codex_home, expected_installed="no", expected_running="no"
             )
+            print("[smoke] service reached installed=no running=no")
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -150,13 +164,30 @@ def command_env() -> dict[str, str]:
 
 
 def run_command(binary_path: pathlib.Path, codex_home: pathlib.Path, *args: str) -> str:
-    completed = subprocess.run(
-        [str(binary_path), "--codex-home", str(codex_home), *args],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=command_env(),
-    )
+    command = [str(binary_path), "--codex-home", str(codex_home), *args]
+    print(f"[smoke] running: {' '.join(command)}")
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=command_env(),
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as err:
+        stdout = (err.stdout or "").strip()
+        stderr = (err.stderr or "").strip()
+        raise RuntimeError(
+            "command timed out after "
+            f"{COMMAND_TIMEOUT_SECONDS}s: {' '.join(command)}\n\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
+        ) from err
+    except subprocess.CalledProcessError as err:
+        stdout = (err.stdout or "").strip()
+        stderr = (err.stderr or "").strip()
+        raise RuntimeError(
+            f"command failed: {' '.join(command)}\n\nstdout:\n{stdout}\n\nstderr:\n{stderr}"
+        ) from err
     return completed.stdout
 
 
