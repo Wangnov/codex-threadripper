@@ -727,7 +727,11 @@ fn ensure_sqlite_exists(sqlite_path: &Path) -> Result<()> {
 }
 
 fn sync_file(path: &Path) -> Result<()> {
-    let file = File::open(path).with_context(|| format!("open for sync: {}", path.display()))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("open for sync: {}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("fsync: {}", path.display()))?;
     Ok(())
@@ -735,7 +739,10 @@ fn sync_file(path: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<()> {
-    sync_file(path)
+    let dir = File::open(path).with_context(|| format!("open for sync: {}", path.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("fsync: {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(not(unix))]
