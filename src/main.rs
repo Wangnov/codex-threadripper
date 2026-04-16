@@ -611,6 +611,7 @@ fn inspect_sqlite_distribution(
     sqlite_path: &Path,
     target_provider: &str,
 ) -> Result<(u64, u64, Vec<(String, u64)>)> {
+    ensure_sqlite_exists(sqlite_path)?;
     let connection = Connection::open(sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
     let total_rows: u64 =
@@ -1423,6 +1424,7 @@ mod tests {
     use super::DEFAULT_POLL_INTERVAL_MS;
     use super::Locale;
     use super::detect_locale_from_sources;
+    use super::inspect_sqlite_distribution;
     use super::install_next_steps;
     use super::localized_command;
     use super::parse_apple_languages;
@@ -1566,6 +1568,20 @@ mod tests {
 
         assert!(err.to_string().contains(&sqlite_path.display().to_string()));
         assert!(!sqlite_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_sqlite_distribution_returns_error_when_db_missing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sqlite_path = dir.path().join("state_5.sqlite");
+        let backups_path = dir.path().join("backups");
+
+        let err = inspect_sqlite_distribution(&sqlite_path, "openai").unwrap_err();
+
+        assert!(err.to_string().contains(&sqlite_path.display().to_string()));
+        assert!(!sqlite_path.exists());
+        assert!(!backups_path.exists());
         Ok(())
     }
 
