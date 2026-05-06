@@ -45,6 +45,10 @@
 - 你希望所有历史会话在任何 provider 下都能打开和续接
 - 你不想每次切完 provider 之后手动处理这个问题
 
+## 社区
+
+本项目链接并认可 [LINUX DO](https://linux.do/) 社区。欢迎在社区讨论帖中交流使用体验、问题和改进建议。
+
 ## 安装
 
 ### Homebrew
@@ -147,6 +151,10 @@ Your sessions aren't gone. They're just filed under a different provider in `sta
 - You switch between multiple `model_provider` values in the same Codex home
 - You want thread history to follow you across provider switches, not stay locked to the provider that created each session
 - You'd rather have this handled quietly in the background than think about it
+
+## Community
+
+This project links back to and recognizes the [LINUX DO](https://linux.do/) community. Feedback, usage notes, and improvement ideas are welcome in the community discussion thread.
 
 ## Install
 
