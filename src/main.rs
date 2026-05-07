@@ -17,9 +17,18 @@ use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use rusqlite::backup::StepResult;
 use serde::Deserialize;
+use serde_json::Value;
+use serde_json::json;
 use std::ffi::OsStr;
+use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -35,6 +44,9 @@ use std::time::UNIX_EPOCH;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PROVIDER: &str = "openai";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
+const DEFAULT_BUCKET_PADDING_BYTES: usize = 256;
+
+type ProviderDistribution = Vec<(String, u64)>;
 
 mod service;
 
@@ -74,7 +86,15 @@ enum Command {
     /// placeholder
     Status,
     /// placeholder
-    Sync,
+    Sync {
+        #[arg(long, help = "placeholder")]
+        sqlite_only: bool,
+    },
+    /// placeholder
+    Bucket {
+        #[command(subcommand)]
+        command: BucketCommand,
+    },
     /// placeholder
     #[command(alias = "daemon")]
     Watch {
@@ -85,6 +105,8 @@ enum Command {
             help = "placeholder"
         )]
         poll_interval_ms: u64,
+        #[arg(long, help = "placeholder")]
+        sqlite_only: bool,
     },
     /// placeholder
     #[command(name = "print-service-config", alias = "print-plist")]
@@ -113,6 +135,32 @@ enum Command {
     UninstallService,
 }
 
+#[derive(Subcommand, Debug)]
+enum BucketCommand {
+    /// placeholder
+    Prepare {
+        #[arg(
+            long,
+            default_value_t = DEFAULT_BUCKET_PADDING_BYTES,
+            value_name = "BYTES",
+            help = "placeholder"
+        )]
+        padding_bytes: usize,
+    },
+    /// placeholder
+    Switch {
+        #[arg(value_name = "PROVIDER")]
+        target_provider: Option<String>,
+        #[arg(
+            long,
+            default_value_t = DEFAULT_BUCKET_PADDING_BYTES,
+            value_name = "BYTES",
+            help = "placeholder"
+        )]
+        padding_bytes: usize,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 struct ConfigToml {
     model_provider: Option<String>,
@@ -123,8 +171,13 @@ struct ReconcileSummary {
     provider: String,
     changed_rows: u64,
     total_rows: u64,
+    changed_rollouts: u64,
+    checked_rollouts: u64,
+    prepared_rollouts: u64,
+    skipped_rollouts: u64,
     elapsed: Duration,
     backup_path: Option<PathBuf>,
+    rollout_journal_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -135,8 +188,63 @@ struct StatusSummary {
     provider: String,
     total_rows: u64,
     mismatched_rows: u64,
-    distribution: Vec<(String, u64)>,
+    distribution: ProviderDistribution,
     service_status: BackgroundServiceStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RolloutScope {
+    None,
+    MismatchedRows,
+    AllRows,
+}
+
+#[derive(Debug)]
+struct RolloutTarget {
+    thread_id: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct RolloutReconcileSummary {
+    checked_files: u64,
+    changed_files: u64,
+    prepared_files: u64,
+    skipped_files: u64,
+    journal_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct BucketPrepareSummary {
+    checked_rollouts: u64,
+    prepared_rollouts: u64,
+    skipped_rollouts: u64,
+    elapsed: Duration,
+    journal_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct FirstLine {
+    content: Vec<u8>,
+    newline: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct RolloutPatchOutcome {
+    changed: bool,
+    prepared: bool,
+    skipped: bool,
+}
+
+struct RolloutChangeJournal {
+    path: PathBuf,
+    writer: Option<BufWriter<File>>,
+}
+
+#[derive(Clone, Copy)]
+enum RolloutChangeMode {
+    InPlace,
+    RewriteWithPadding,
 }
 
 fn main() -> Result<()> {
@@ -150,15 +258,54 @@ fn main() -> Result<()> {
             let summary = collect_status(&codex_home, cli.provider.as_deref())?;
             print_status(locale, &summary);
         }
-        Command::Sync => {
-            let summary = reconcile_once_with_backup(&codex_home, cli.provider.as_deref())?;
+        Command::Sync { sqlite_only } => {
+            let summary = reconcile_once_with_backup(
+                &codex_home,
+                cli.provider.as_deref(),
+                if sqlite_only {
+                    RolloutScope::None
+                } else {
+                    RolloutScope::AllRows
+                },
+            )?;
             print_sync_summary(locale, sync_complete_title(locale), &summary);
         }
-        Command::Watch { poll_interval_ms } => {
+        Command::Bucket { command } => match command {
+            BucketCommand::Prepare { padding_bytes } => {
+                let summary = prepare_bucket_padding(&codex_home, padding_bytes)?;
+                print_bucket_prepare_summary(locale, &summary);
+            }
+            BucketCommand::Switch {
+                target_provider,
+                padding_bytes,
+            } => {
+                validate_provider_override(locale, target_provider.as_deref())?;
+                let provider = match target_provider {
+                    Some(provider) => Some(provider),
+                    None => cli.provider.clone(),
+                };
+                let summary = reconcile_once_with_backup_and_padding(
+                    &codex_home,
+                    provider.as_deref(),
+                    RolloutScope::AllRows,
+                    padding_bytes,
+                )?;
+                print_sync_summary(locale, bucket_switch_complete_title(locale), &summary);
+            }
+        },
+        Command::Watch {
+            poll_interval_ms,
+            sqlite_only,
+        } => {
             run_watch(
                 locale,
                 &codex_home,
                 cli.provider.clone(),
+                if sqlite_only {
+                    RolloutScope::None
+                } else {
+                    RolloutScope::MismatchedRows
+                },
                 Duration::from_millis(poll_interval_ms),
             )?;
         }
@@ -283,6 +430,48 @@ fn localized_command(locale: Locale) -> clap::Command {
             .disable_version_flag(true)
             .disable_help_subcommand(true)
             .help_template(help_template(locale))
+            .mut_arg("sqlite_only", |arg| {
+                arg.help(sqlite_only_help(locale))
+                    .help_heading(options_heading(locale))
+            })
+    });
+    command = command.mut_subcommand("bucket", |sub| {
+        sub.about(bucket_about(locale))
+            .version(APP_VERSION)
+            .disable_help_flag(true)
+            .disable_version_flag(true)
+            .disable_help_subcommand(true)
+            .help_template(help_template(locale))
+            .mut_subcommand("prepare", |sub| {
+                sub.about(bucket_prepare_about(locale))
+                    .version(APP_VERSION)
+                    .disable_help_flag(true)
+                    .disable_version_flag(true)
+                    .disable_help_subcommand(true)
+                    .help_template(help_template(locale))
+                    .mut_arg("padding_bytes", |arg| {
+                        arg.help(padding_bytes_help(locale))
+                            .help_heading(options_heading(locale))
+                            .value_name(bytes_value_name(locale))
+                    })
+            })
+            .mut_subcommand("switch", |sub| {
+                sub.about(bucket_switch_about(locale))
+                    .version(APP_VERSION)
+                    .disable_help_flag(true)
+                    .disable_version_flag(true)
+                    .disable_help_subcommand(true)
+                    .help_template(help_template(locale))
+                    .mut_arg("target_provider", |arg| {
+                        arg.help(bucket_switch_provider_help(locale))
+                            .value_name(provider_value_name(locale))
+                    })
+                    .mut_arg("padding_bytes", |arg| {
+                        arg.help(padding_bytes_help(locale))
+                            .help_heading(options_heading(locale))
+                            .value_name(bytes_value_name(locale))
+                    })
+            })
     });
     command = command.mut_subcommand("watch", |sub| {
         sub.about(watch_about(locale))
@@ -291,6 +480,10 @@ fn localized_command(locale: Locale) -> clap::Command {
             .disable_version_flag(true)
             .disable_help_subcommand(true)
             .help_template(help_template(locale))
+            .mut_arg("sqlite_only", |arg| {
+                arg.help(sqlite_only_help(locale))
+                    .help_heading(options_heading(locale))
+            })
             .mut_arg("poll_interval_ms", |arg| {
                 arg.help(poll_interval_help(locale))
                     .help_heading(options_heading(locale))
@@ -337,11 +530,11 @@ fn localized_command(locale: Locale) -> clap::Command {
 
 fn detect_locale() -> Locale {
     let mut candidates = Vec::new();
-    if let Some(value) = std::env::var("CODEX_THREADRIPPER_LANG").ok() {
+    if let Ok(value) = std::env::var("CODEX_THREADRIPPER_LANG") {
         candidates.push(value);
     }
     for key in ["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Some(value) = std::env::var(key).ok() {
+        if let Ok(value) = std::env::var(key) {
             candidates.push(value);
         }
     }
@@ -414,11 +607,13 @@ fn run_watch(
     locale: Locale,
     codex_home: &Path,
     provider_override: Option<String>,
+    rollout_scope: RolloutScope,
     poll_interval: Duration,
 ) -> Result<()> {
     let lock_path = codex_home.join("watch.lock");
     let watch_lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -452,7 +647,7 @@ fn run_watch(
     }
 
     let mut last_provider = None;
-    match reconcile_once(codex_home, provider_override.as_deref()) {
+    match reconcile_once(codex_home, provider_override.as_deref(), rollout_scope) {
         Ok(summary) => {
             print_sync_summary(locale, watch_started_title(locale), &summary);
             last_provider = Some(summary.provider.clone());
@@ -473,10 +668,11 @@ fn run_watch(
         match rx.recv_timeout(timeout) {
             Ok(Ok(event)) => {
                 if touches_config_file(&event, &config_path) {
-                    match reconcile_once(codex_home, provider_override.as_deref()) {
+                    match reconcile_once(codex_home, provider_override.as_deref(), rollout_scope) {
                         Ok(summary) => {
                             if last_provider.as_deref() != Some(summary.provider.as_str())
                                 || summary.changed_rows > 0
+                                || summary.changed_rollouts > 0
                             {
                                 print_sync_summary(locale, config_change_title(locale), &summary);
                             }
@@ -493,10 +689,11 @@ fn run_watch(
                 eprintln!("{}", watcher_error_message(locale, err));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                match reconcile_once(codex_home, provider_override.as_deref()) {
+                match reconcile_once(codex_home, provider_override.as_deref(), rollout_scope) {
                     Ok(summary) => {
                         if last_provider.as_deref() != Some(summary.provider.as_str())
                             || summary.changed_rows > 0
+                            || summary.changed_rollouts > 0
                         {
                             print_sync_summary(
                                 locale,
@@ -551,27 +748,10 @@ fn collect_status(codex_home: &Path, provider_override: Option<&str>) -> Result<
     })
 }
 
-fn reconcile_once(codex_home: &Path, provider_override: Option<&str>) -> Result<ReconcileSummary> {
-    let provider = match provider_override {
-        Some(provider) => provider.to_string(),
-        None => read_provider_from_config(codex_home)?,
-    };
-    let sqlite_path = codex_home.join("state_5.sqlite");
-    let started = Instant::now();
-    let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
-
-    Ok(ReconcileSummary {
-        provider,
-        changed_rows,
-        total_rows,
-        elapsed: started.elapsed(),
-        backup_path: None,
-    })
-}
-
-fn reconcile_once_with_backup(
+fn reconcile_once(
     codex_home: &Path,
     provider_override: Option<&str>,
+    rollout_scope: RolloutScope,
 ) -> Result<ReconcileSummary> {
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
@@ -579,15 +759,88 @@ fn reconcile_once_with_backup(
     };
     let sqlite_path = codex_home.join("state_5.sqlite");
     let started = Instant::now();
-    let (changed_rows, total_rows, backup_path) =
-        reconcile_sqlite_with_backup(&sqlite_path, provider.as_str())?;
+    let rollout_summary = reconcile_rollout_metadata_from_sqlite(
+        &sqlite_path,
+        codex_home,
+        provider.as_str(),
+        rollout_scope,
+        None,
+        DEFAULT_BUCKET_PADDING_BYTES,
+    )?;
+    let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
 
     Ok(ReconcileSummary {
         provider,
         changed_rows,
         total_rows,
+        changed_rollouts: rollout_summary.changed_files,
+        checked_rollouts: rollout_summary.checked_files,
+        prepared_rollouts: rollout_summary.prepared_files,
+        skipped_rollouts: rollout_summary.skipped_files,
+        elapsed: started.elapsed(),
+        backup_path: None,
+        rollout_journal_path: rollout_summary.journal_path,
+    })
+}
+
+fn reconcile_once_with_backup(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    rollout_scope: RolloutScope,
+) -> Result<ReconcileSummary> {
+    reconcile_once_with_backup_and_padding(
+        codex_home,
+        provider_override,
+        rollout_scope,
+        DEFAULT_BUCKET_PADDING_BYTES,
+    )
+}
+
+fn reconcile_once_with_backup_and_padding(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    rollout_scope: RolloutScope,
+    padding_bytes: usize,
+) -> Result<ReconcileSummary> {
+    let provider = match provider_override {
+        Some(provider) => provider.to_string(),
+        None => read_provider_from_config(codex_home)?,
+    };
+    let sqlite_path = codex_home.join("state_5.sqlite");
+    let started = Instant::now();
+    let backup_path = create_sqlite_backup_file(&sqlite_path)?;
+    let rollout_journal_path =
+        backup_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(
+                "rollouts.{}.jsonl",
+                backup_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("state_5.sqlite.bak")
+            ));
+    let rollout_summary = reconcile_rollout_metadata_from_sqlite(
+        &sqlite_path,
+        codex_home,
+        provider.as_str(),
+        rollout_scope,
+        Some(rollout_journal_path.as_path()),
+        padding_bytes,
+    )?;
+    let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
+
+    Ok(ReconcileSummary {
+        provider,
+        changed_rows,
+        total_rows,
+        changed_rollouts: rollout_summary.changed_files,
+        checked_rollouts: rollout_summary.checked_files,
+        prepared_rollouts: rollout_summary.prepared_files,
+        skipped_rollouts: rollout_summary.skipped_files,
         elapsed: started.elapsed(),
         backup_path: Some(backup_path),
+        rollout_journal_path: rollout_summary.journal_path,
     })
 }
 
@@ -607,10 +860,472 @@ fn read_provider_from_config(codex_home: &Path) -> Result<String> {
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()))
 }
 
+fn reconcile_rollout_metadata_from_sqlite(
+    sqlite_path: &Path,
+    _codex_home: &Path,
+    provider: &str,
+    scope: RolloutScope,
+    journal_path: Option<&Path>,
+    padding_bytes: usize,
+) -> Result<RolloutReconcileSummary> {
+    if scope == RolloutScope::None {
+        return Ok(RolloutReconcileSummary::default());
+    }
+    let targets = rollout_targets_for_scope(sqlite_path, provider, scope)?;
+    reconcile_rollout_metadata_files(targets.as_slice(), provider, journal_path, padding_bytes)
+}
+
+fn rollout_targets_for_scope(
+    sqlite_path: &Path,
+    provider: &str,
+    scope: RolloutScope,
+) -> Result<Vec<RolloutTarget>> {
+    ensure_sqlite_exists(sqlite_path)?;
+    let connection = Connection::open(sqlite_path)
+        .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
+    let sql = match scope {
+        RolloutScope::None => return Ok(Vec::new()),
+        RolloutScope::MismatchedRows => {
+            "SELECT id, rollout_path FROM threads WHERE model_provider <> ?1 AND rollout_path <> '' ORDER BY updated_at DESC"
+        }
+        RolloutScope::AllRows => {
+            "SELECT id, rollout_path FROM threads WHERE rollout_path <> '' ORDER BY updated_at DESC"
+        }
+    };
+    let mut statement = connection.prepare(sql)?;
+    if scope == RolloutScope::MismatchedRows {
+        let rows = statement.query_map([provider], |row| {
+            Ok(RolloutTarget {
+                thread_id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    } else {
+        let rows = statement.query_map([], |row| {
+            Ok(RolloutTarget {
+                thread_id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+}
+
+fn reconcile_rollout_metadata_files(
+    targets: &[RolloutTarget],
+    provider: &str,
+    journal_path: Option<&Path>,
+    padding_bytes: usize,
+) -> Result<RolloutReconcileSummary> {
+    let mut summary = RolloutReconcileSummary::default();
+    let mut journal = journal_path.map(|path| RolloutChangeJournal::new(path.to_path_buf()));
+    for target in targets {
+        if !target.path.exists() {
+            continue;
+        }
+        summary.checked_files += 1;
+        let outcome =
+            rewrite_rollout_provider_first_line(target, provider, journal.as_mut(), padding_bytes)?;
+        if outcome.changed {
+            summary.changed_files += 1;
+        }
+        if outcome.prepared {
+            summary.prepared_files += 1;
+        }
+        if outcome.skipped {
+            summary.skipped_files += 1;
+        }
+    }
+    if let Some(journal) = journal {
+        summary.journal_path = journal.finish()?;
+    }
+    Ok(summary)
+}
+
+fn rewrite_rollout_provider_first_line(
+    target: &RolloutTarget,
+    provider: &str,
+    journal: Option<&mut RolloutChangeJournal>,
+    padding_bytes: usize,
+) -> Result<RolloutPatchOutcome> {
+    let first_line = read_first_line(&target.path)?;
+    let Some(mut value) =
+        parse_matching_session_meta(first_line.content.as_slice(), target.thread_id.as_str())?
+    else {
+        return Ok(RolloutPatchOutcome {
+            skipped: true,
+            ..RolloutPatchOutcome::default()
+        });
+    };
+    let old_provider = session_meta_provider(&value).unwrap_or("").to_string();
+
+    if !set_session_meta_provider(&mut value, provider) {
+        return Ok(RolloutPatchOutcome::default());
+    }
+
+    let rendered = serde_json::to_vec(&value)
+        .with_context(|| format!("failed to render {}", target.path.display()))?;
+    if rendered.len() <= first_line.content.len() {
+        let mut replacement = rendered;
+        replacement.resize(first_line.content.len(), b' ');
+        record_rollout_change(
+            journal,
+            target,
+            old_provider.as_str(),
+            provider,
+            first_line.content.len(),
+            replacement.len(),
+            RolloutChangeMode::InPlace,
+        )?;
+        patch_first_line_in_place(
+            &target.path,
+            replacement.as_slice(),
+            first_line.newline.as_slice(),
+        )?;
+        return Ok(RolloutPatchOutcome {
+            changed: true,
+            ..RolloutPatchOutcome::default()
+        });
+    }
+
+    let mut replacement = rendered;
+    replacement.resize(replacement.len() + padding_bytes, b' ');
+    record_rollout_change(
+        journal,
+        target,
+        old_provider.as_str(),
+        provider,
+        first_line.content.len(),
+        replacement.len(),
+        RolloutChangeMode::RewriteWithPadding,
+    )?;
+    rewrite_first_line_atomically(
+        &target.path,
+        replacement.as_slice(),
+        first_line.newline.as_slice(),
+    )?;
+    Ok(RolloutPatchOutcome {
+        changed: true,
+        prepared: true,
+        ..RolloutPatchOutcome::default()
+    })
+}
+
+fn prepare_bucket_padding(codex_home: &Path, padding_bytes: usize) -> Result<BucketPrepareSummary> {
+    let sqlite_path = codex_home.join("state_5.sqlite");
+    let started = Instant::now();
+    let targets = rollout_targets_for_scope(&sqlite_path, DEFAULT_PROVIDER, RolloutScope::AllRows)?;
+    let journal_path = codex_home
+        .join("backups")
+        .join(format!("bucket-prepare.{}.jsonl", unix_timestamp_millis()?));
+    let mut journal = RolloutChangeJournal::new(journal_path);
+    let mut checked_rollouts = 0;
+    let mut prepared_rollouts = 0;
+    let mut skipped_rollouts = 0;
+
+    for target in &targets {
+        if !target.path.exists() {
+            continue;
+        }
+        checked_rollouts += 1;
+        let outcome = prepare_rollout_first_line_padding(target, &mut journal, padding_bytes)?;
+        if outcome.prepared {
+            prepared_rollouts += 1;
+        }
+        if outcome.skipped {
+            skipped_rollouts += 1;
+        }
+    }
+    let journal_path = journal.finish()?;
+
+    Ok(BucketPrepareSummary {
+        checked_rollouts,
+        prepared_rollouts,
+        skipped_rollouts,
+        elapsed: started.elapsed(),
+        journal_path,
+    })
+}
+
+fn prepare_rollout_first_line_padding(
+    target: &RolloutTarget,
+    journal: &mut RolloutChangeJournal,
+    padding_bytes: usize,
+) -> Result<RolloutPatchOutcome> {
+    let first_line = read_first_line(&target.path)?;
+    let Some(value) =
+        parse_matching_session_meta(first_line.content.as_slice(), target.thread_id.as_str())?
+    else {
+        return Ok(RolloutPatchOutcome {
+            skipped: true,
+            ..RolloutPatchOutcome::default()
+        });
+    };
+    let old_provider = session_meta_provider(&value).unwrap_or("").to_string();
+
+    let rendered = serde_json::to_vec(&value)
+        .with_context(|| format!("failed to render {}", target.path.display()))?;
+    let desired_len = rendered.len() + padding_bytes;
+    if first_line.content.len() >= desired_len {
+        return Ok(RolloutPatchOutcome::default());
+    }
+
+    let mut replacement = rendered;
+    replacement.resize(desired_len, b' ');
+    record_rollout_change(
+        Some(journal),
+        target,
+        old_provider.as_str(),
+        old_provider.as_str(),
+        first_line.content.len(),
+        replacement.len(),
+        RolloutChangeMode::RewriteWithPadding,
+    )?;
+    rewrite_first_line_atomically(
+        &target.path,
+        replacement.as_slice(),
+        first_line.newline.as_slice(),
+    )?;
+    Ok(RolloutPatchOutcome {
+        changed: true,
+        prepared: true,
+        ..RolloutPatchOutcome::default()
+    })
+}
+
+fn read_first_line(path: &Path) -> Result<FirstLine> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = Vec::new();
+    reader
+        .read_until(b'\n', &mut buffer)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    if buffer.is_empty() {
+        anyhow::bail!("empty rollout file: {}", path.display());
+    }
+
+    let mut newline = Vec::new();
+    if buffer.ends_with(b"\n") {
+        buffer.pop();
+        if buffer.ends_with(b"\r") {
+            buffer.pop();
+            newline.extend_from_slice(b"\r\n");
+        } else {
+            newline.push(b'\n');
+        }
+    }
+
+    Ok(FirstLine {
+        content: buffer,
+        newline,
+    })
+}
+
+fn parse_matching_session_meta(line: &[u8], thread_id: &str) -> Result<Option<Value>> {
+    let value = serde_json::from_slice::<Value>(line)?;
+    if session_meta_belongs_to_thread(&value, thread_id) {
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
+}
+
+fn patch_first_line_in_place(path: &Path, replacement: &[u8], newline: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to seek {}", path.display()))?;
+    file.write_all(replacement)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.write_all(newline)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn rewrite_first_line_atomically(path: &Path, replacement: &[u8], newline: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rollout.jsonl");
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.threadripper.tmp",
+        std::process::id()
+    ));
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+
+    {
+        let input =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let mut reader = BufReader::new(input);
+        let mut ignored_first_line = Vec::new();
+        reader
+            .read_until(b'\n', &mut ignored_first_line)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        let output = File::create(&temp_path)
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        fs::set_permissions(&temp_path, metadata.permissions())
+            .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
+        let mut writer = BufWriter::new(output);
+        writer
+            .write_all(replacement)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        writer
+            .write_all(newline)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        std::io::copy(&mut reader, &mut writer)
+            .with_context(|| format!("failed to copy {}", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .with_context(|| format!("fsync: {}", temp_path.display()))?;
+    }
+
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
+    sync_dir(parent)?;
+    Ok(())
+}
+
+fn record_rollout_change(
+    journal: Option<&mut RolloutChangeJournal>,
+    target: &RolloutTarget,
+    old_provider: &str,
+    new_provider: &str,
+    old_len: usize,
+    new_len: usize,
+    mode: RolloutChangeMode,
+) -> Result<()> {
+    if let Some(journal) = journal {
+        journal.record(target, old_provider, new_provider, old_len, new_len, mode)?;
+    }
+    Ok(())
+}
+
+impl RolloutChangeJournal {
+    fn new(path: PathBuf) -> Self {
+        Self { path, writer: None }
+    }
+
+    fn record(
+        &mut self,
+        target: &RolloutTarget,
+        old_provider: &str,
+        new_provider: &str,
+        old_len: usize,
+        new_len: usize,
+        mode: RolloutChangeMode,
+    ) -> Result<()> {
+        if self.writer.is_none() {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            let file = File::create(&self.path)
+                .with_context(|| format!("failed to create {}", self.path.display()))?;
+            self.writer = Some(BufWriter::new(file));
+        }
+
+        let writer = self.writer.as_mut().expect("journal writer initialized");
+        serde_json::to_writer(
+            &mut *writer,
+            &json!({
+                "path": target.path.display().to_string(),
+                "thread_id": target.thread_id.as_str(),
+                "mode": mode.as_str(),
+                "old_provider": old_provider,
+                "new_provider": new_provider,
+                "old_first_line_len": old_len,
+                "new_first_line_len": new_len,
+            }),
+        )
+        .with_context(|| format!("failed to write {}", self.path.display()))?;
+        writer
+            .write_all(b"\n")
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Option<PathBuf>> {
+        let Some(mut writer) = self.writer.take() else {
+            return Ok(None);
+        };
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", self.path.display()))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .with_context(|| format!("fsync: {}", self.path.display()))?;
+        if let Some(parent) = self.path.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(Some(self.path))
+    }
+}
+
+impl RolloutChangeMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InPlace => "in_place",
+            Self::RewriteWithPadding => "rewrite_with_padding",
+        }
+    }
+}
+
+fn session_meta_belongs_to_thread(value: &Value, thread_id: &str) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("session_meta")
+        && value
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(Value::as_str)
+            == Some(thread_id)
+}
+
+fn session_meta_provider(value: &Value) -> Option<&str> {
+    value
+        .get("payload")
+        .and_then(|payload| payload.get("model_provider"))
+        .and_then(Value::as_str)
+}
+
+fn set_session_meta_provider(value: &mut Value, provider: &str) -> bool {
+    let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    if payload
+        .get("model_provider")
+        .and_then(Value::as_str)
+        .is_some_and(|current| current == provider)
+    {
+        return false;
+    }
+    payload.insert(
+        "model_provider".to_string(),
+        Value::String(provider.to_string()),
+    );
+    true
+}
+
 fn inspect_sqlite_distribution(
     sqlite_path: &Path,
     target_provider: &str,
-) -> Result<(u64, u64, Vec<(String, u64)>)> {
+) -> Result<(u64, u64, ProviderDistribution)> {
     ensure_sqlite_exists(sqlite_path)?;
     let connection = Connection::open(sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
@@ -651,34 +1366,44 @@ fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> Result<(u64,
     Ok((changed_rows, total_rows))
 }
 
+#[cfg(test)]
 fn reconcile_sqlite_with_backup(sqlite_path: &Path, provider: &str) -> Result<(u64, u64, PathBuf)> {
+    let backup_path = create_sqlite_backup_file(sqlite_path)?;
+    let (changed_rows, total_rows) = reconcile_sqlite_in_place(sqlite_path, provider)?;
+    Ok((changed_rows, total_rows, backup_path))
+}
+
+fn create_sqlite_backup_file(sqlite_path: &Path) -> Result<PathBuf> {
     let backups_dir = sqlite_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("backups");
-    std::fs::create_dir_all(&backups_dir)
+    fs::create_dir_all(&backups_dir)
         .with_context(|| format!("failed to create {}", backups_dir.display()))?;
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is earlier than UNIX_EPOCH")?
-        .as_millis();
+    let timestamp = unix_timestamp_millis()?;
     let backup_name = format!("state_5.sqlite.{timestamp}.bak");
     let backup_path = backups_dir.join(&backup_name);
     let backup_temp_path = backups_dir.join(format!("{backup_name}.tmp"));
 
     if backup_temp_path.exists() {
-        std::fs::remove_file(&backup_temp_path)
+        fs::remove_file(&backup_temp_path)
             .with_context(|| format!("failed to remove {}", backup_temp_path.display()))?;
     }
 
     create_sqlite_backup(sqlite_path, &backup_temp_path)?;
-    std::fs::rename(&backup_temp_path, &backup_path)
+    fs::rename(&backup_temp_path, &backup_path)
         .with_context(|| format!("failed to finalize {}", backup_path.display()))?;
     sync_dir(&backups_dir)?;
 
-    let (changed_rows, total_rows) = reconcile_sqlite_in_place(sqlite_path, provider)?;
-    Ok((changed_rows, total_rows, backup_path))
+    Ok(backup_path)
+}
+
+fn unix_timestamp_millis() -> Result<u128> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is earlier than UNIX_EPOCH")?
+        .as_millis())
 }
 
 fn create_sqlite_backup(sqlite_path: &Path, backup_path: &Path) -> Result<()> {
@@ -871,6 +1596,32 @@ fn print_sync_summary(locale: Locale, title: &str, summary: &ReconcileSummary) {
         sync_rows_updated_label(locale),
         summary.changed_rows
     );
+    if summary.checked_rollouts > 0 || summary.changed_rollouts > 0 {
+        println!(
+            "{}: {}",
+            sync_rollouts_checked_label(locale),
+            summary.checked_rollouts
+        );
+        println!(
+            "{}: {}",
+            sync_rollouts_updated_label(locale),
+            summary.changed_rollouts
+        );
+        if summary.prepared_rollouts > 0 {
+            println!(
+                "{}: {}",
+                sync_rollouts_prepared_label(locale),
+                summary.prepared_rollouts
+            );
+        }
+        if summary.skipped_rollouts > 0 {
+            println!(
+                "{}: {}",
+                sync_rollouts_skipped_label(locale),
+                summary.skipped_rollouts
+            );
+        }
+    }
     println!(
         "{}: {}",
         status_total_threads_label(locale),
@@ -883,6 +1634,46 @@ fn print_sync_summary(locale: Locale, title: &str, summary: &ReconcileSummary) {
     );
     if let Some(backup_path) = &summary.backup_path {
         println!("{}: {}", sync_backup_label(locale), backup_path.display());
+    }
+    if let Some(journal_path) = &summary.rollout_journal_path {
+        println!(
+            "{}: {}",
+            sync_rollout_journal_label(locale),
+            journal_path.display()
+        );
+    }
+}
+
+fn print_bucket_prepare_summary(locale: Locale, summary: &BucketPrepareSummary) {
+    println!("{}", bucket_prepare_complete_title(locale));
+    println!(
+        "{}: {}",
+        sync_rollouts_checked_label(locale),
+        summary.checked_rollouts
+    );
+    println!(
+        "{}: {}",
+        sync_rollouts_prepared_label(locale),
+        summary.prepared_rollouts
+    );
+    if summary.skipped_rollouts > 0 {
+        println!(
+            "{}: {}",
+            sync_rollouts_skipped_label(locale),
+            summary.skipped_rollouts
+        );
+    }
+    println!(
+        "{}: {} ms",
+        sync_elapsed_label(locale),
+        summary.elapsed.as_millis()
+    );
+    if let Some(journal_path) = &summary.journal_path {
+        println!(
+            "{}: {}",
+            sync_rollout_journal_label(locale),
+            journal_path.display()
+        );
     }
 }
 
@@ -955,6 +1746,13 @@ fn milliseconds_value_name(locale: Locale) -> &'static str {
     }
 }
 
+fn bytes_value_name(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "BYTES",
+        Locale::ZhHans => "字节",
+    }
+}
+
 fn codex_home_help(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Codex home directory. Defaults to $HOME/.codex.",
@@ -1001,15 +1799,52 @@ fn status_about(locale: Locale) -> &'static str {
 
 fn sync_about(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Reconcile state_5.sqlite once right now.",
-        Locale::ZhHans => "立刻执行一次 state_5.sqlite 收敛。",
+        Locale::En => "Reconcile state_5.sqlite and rollout metadata once right now.",
+        Locale::ZhHans => "立刻收敛 state_5.sqlite 和 rollout 元数据。",
+    }
+}
+
+fn bucket_about(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Manage the provider bucket label stored in rollout first lines.",
+        Locale::ZhHans => "管理 rollout 首行里的 provider 可见桶标签。",
+    }
+}
+
+fn bucket_prepare_about(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Reserve first-line padding so future provider bucket switches stay fast.",
+        Locale::ZhHans => "给首行预留 padding，让后续 provider 桶切换保持快速。",
+    }
+}
+
+fn bucket_switch_about(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Switch every thread into one provider bucket.",
+        Locale::ZhHans => "把所有线程切到同一个 provider 可见桶。",
+    }
+}
+
+fn bucket_switch_provider_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Target provider bucket. Defaults to --provider or config.toml.",
+        Locale::ZhHans => "目标 provider 桶。默认读取 --provider 或 config.toml。",
+    }
+}
+
+fn padding_bytes_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Extra JSON whitespace to reserve at the end of the rollout first line.",
+        Locale::ZhHans => "在 rollout 首行末尾预留的额外 JSON 空白字节数。",
     }
 }
 
 fn watch_about(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Keep watching config.toml and keep reconciling new rows in state_5.sqlite.",
-        Locale::ZhHans => "持续监听 config.toml，并持续收敛 state_5.sqlite 里的新增行。",
+        Locale::En => {
+            "Keep watching config.toml and keep reconciling new rows in SQLite and rollout metadata."
+        }
+        Locale::ZhHans => "持续监听 config.toml，并持续收敛 SQLite 与 rollout 新增元数据。",
     }
 }
 
@@ -1017,6 +1852,13 @@ fn poll_interval_help(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "How often to reconcile SQLite while watching.",
         Locale::ZhHans => "watch 模式下，定时收敛 SQLite 的频率。",
+    }
+}
+
+fn sqlite_only_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Only update state_5.sqlite; leave rollout JSONL metadata untouched.",
+        Locale::ZhHans => "只更新 state_5.sqlite，不改 rollout JSONL 元数据。",
     }
 }
 
@@ -1059,6 +1901,20 @@ fn sync_complete_title(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Sync complete",
         Locale::ZhHans => "同步完成",
+    }
+}
+
+fn bucket_switch_complete_title(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Bucket switch complete",
+        Locale::ZhHans => "可见桶切换完成",
+    }
+}
+
+fn bucket_prepare_complete_title(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Bucket prepare complete",
+        Locale::ZhHans => "可见桶准备完成",
     }
 }
 
@@ -1402,6 +2258,34 @@ fn sync_rows_updated_label(locale: Locale) -> &'static str {
     }
 }
 
+fn sync_rollouts_checked_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Rollouts checked",
+        Locale::ZhHans => "已检查 rollout",
+    }
+}
+
+fn sync_rollouts_updated_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Rollouts updated",
+        Locale::ZhHans => "已更新 rollout",
+    }
+}
+
+fn sync_rollouts_prepared_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Rollouts prepared",
+        Locale::ZhHans => "已准备 rollout",
+    }
+}
+
+fn sync_rollouts_skipped_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Rollouts skipped",
+        Locale::ZhHans => "已跳过 rollout",
+    }
+}
+
 fn sync_elapsed_label(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Elapsed",
@@ -1413,6 +2297,13 @@ fn sync_backup_label(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Backup",
         Locale::ZhHans => "备份文件",
+    }
+}
+
+fn sync_rollout_journal_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Rollout first-line journal",
+        Locale::ZhHans => "rollout 首行记录",
     }
 }
 
@@ -1428,8 +2319,10 @@ mod tests {
     use super::APP_VERSION;
     use super::Cli;
     use super::Command;
+    use super::DEFAULT_BUCKET_PADDING_BYTES;
     use super::DEFAULT_POLL_INTERVAL_MS;
     use super::Locale;
+    use super::RolloutScope;
     use super::detect_locale_from_sources;
     use super::inspect_sqlite_distribution;
     use super::install_next_steps;
@@ -1438,6 +2331,7 @@ mod tests {
     use super::parse_locale_tag;
     use super::read_provider_from_config;
     use super::reconcile_once;
+    use super::reconcile_rollout_metadata_from_sqlite;
     use super::reconcile_sqlite_in_place;
     use super::reconcile_sqlite_with_backup;
     use super::validate_provider_override;
@@ -1571,7 +2465,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let sqlite_path = dir.path().join("state_5.sqlite");
 
-        let err = reconcile_once(dir.path(), Some("openai")).unwrap_err();
+        let err = reconcile_once(dir.path(), Some("openai"), RolloutScope::None).unwrap_err();
 
         assert!(err.to_string().contains(&sqlite_path.display().to_string()));
         assert!(!sqlite_path.exists());
@@ -1641,13 +2535,114 @@ mod tests {
     }
 
     #[test]
+    fn durable_sync_updates_matching_rollout_session_meta() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let codex_home = dir.path();
+        let sqlite_path = codex_home.join("state_5.sqlite");
+        let rollout_path =
+            codex_home.join("sessions/2026/05/07/rollout-2026-05-07T14-06-18-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().unwrap())?;
+        fs::write(
+            &rollout_path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}\n",
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\",\"model_provider\":\"cong\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
+            ),
+        )?;
+        seed_sqlite(&sqlite_path)?;
+        let connection = Connection::open(&sqlite_path)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1, model_provider = 'openai' WHERE id = '1'",
+            [rollout_path.display().to_string()],
+        )?;
+        drop(connection);
+
+        let journal_path = codex_home.join("backups/rollouts.test.jsonl");
+        let summary = reconcile_rollout_metadata_from_sqlite(
+            &sqlite_path,
+            codex_home,
+            "openai",
+            RolloutScope::AllRows,
+            Some(journal_path.as_path()),
+            DEFAULT_BUCKET_PADDING_BYTES,
+        )?;
+
+        let rewritten = fs::read_to_string(&rollout_path)?;
+        let journal = fs::read_to_string(&journal_path)?;
+        assert_eq!(summary.checked_files, 1);
+        assert_eq!(summary.changed_files, 1);
+        assert!(rewritten.contains("\"id\":\"1\""));
+        assert!(rewritten.contains("\"model_provider\":\"openai\""));
+        assert!(rewritten.contains("\"id\":\"other\""));
+        assert!(rewritten.contains("\"model_provider\":\"cong\""));
+        assert!(journal.contains("\"mode\":\"rewrite_with_padding\""));
+        assert!(journal.contains("cong"));
+        Ok(())
+    }
+
+    #[test]
+    fn durable_sync_patches_shorter_provider_in_place() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let codex_home = dir.path();
+        let sqlite_path = codex_home.join("state_5.sqlite");
+        let rollout_path =
+            codex_home.join("sessions/2026/05/07/rollout-2026-05-07T14-06-18-1.jsonl");
+        fs::create_dir_all(rollout_path.parent().unwrap())?;
+        fs::write(
+            &rollout_path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"openai\"}}      \n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
+            ),
+        )?;
+        seed_sqlite(&sqlite_path)?;
+        let connection = Connection::open(&sqlite_path)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1, model_provider = 'openai' WHERE id = '1'",
+            [rollout_path.display().to_string()],
+        )?;
+        drop(connection);
+        let before_len = fs::metadata(&rollout_path)?.len();
+
+        let journal_path = codex_home.join("backups/rollouts.in-place.jsonl");
+        let summary = reconcile_rollout_metadata_from_sqlite(
+            &sqlite_path,
+            codex_home,
+            "cong",
+            RolloutScope::AllRows,
+            Some(journal_path.as_path()),
+            DEFAULT_BUCKET_PADDING_BYTES,
+        )?;
+
+        let after_len = fs::metadata(&rollout_path)?.len();
+        let rewritten = fs::read_to_string(&rollout_path)?;
+        let journal = fs::read_to_string(&journal_path)?;
+        assert_eq!(summary.checked_files, 1);
+        assert_eq!(summary.changed_files, 1);
+        assert_eq!(summary.prepared_files, 0);
+        assert_eq!(before_len, after_len);
+        assert!(
+            rewritten
+                .lines()
+                .next()
+                .unwrap()
+                .contains("\"model_provider\":\"cong\"")
+        );
+        assert!(journal.contains("\"mode\":\"in_place\""));
+        Ok(())
+    }
+
+    #[test]
     fn watch_uses_five_hundred_ms_by_default() -> Result<()> {
         let matches =
             localized_command(Locale::En).try_get_matches_from(["codex-threadripper", "watch"])?;
         let cli = Cli::from_arg_matches(&matches)?;
 
         match cli.command {
-            Command::Watch { poll_interval_ms } => {
+            Command::Watch {
+                poll_interval_ms, ..
+            } => {
                 assert_eq!(poll_interval_ms, DEFAULT_POLL_INTERVAL_MS);
             }
             other => panic!("expected watch command, got {other:?}"),
