@@ -6,6 +6,8 @@ use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::Parser;
 use clap::Subcommand;
+use filetime::FileTime;
+use filetime::set_file_times;
 use fs2::FileExt;
 use notify::Config as NotifyConfig;
 use notify::EventKind;
@@ -26,6 +28,7 @@ use std::fs::OpenOptions;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::io::BufWriter;
+use std::io::IsTerminal;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
@@ -45,6 +48,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PROVIDER: &str = "openai";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_BUCKET_PADDING_BYTES: usize = 256;
+const ROLLOUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
 type ProviderDistribution = Vec<(String, u64)>;
 
@@ -223,10 +227,86 @@ struct BucketPrepareSummary {
     journal_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RolloutProgressConfig {
+    locale: Locale,
+}
+
+struct RolloutProgress {
+    config: RolloutProgressConfig,
+    total_files: u64,
+    visited_files: u64,
+    started_at: Instant,
+    last_print_at: Instant,
+    is_terminal: bool,
+    printed: bool,
+}
+
 #[derive(Debug)]
 struct FirstLine {
     content: Vec<u8>,
     newline: Vec<u8>,
+}
+
+impl RolloutProgress {
+    fn new(config: RolloutProgressConfig, total_files: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            config,
+            total_files,
+            visited_files: 0,
+            started_at: now,
+            last_print_at: now,
+            is_terminal: std::io::stderr().is_terminal(),
+            printed: false,
+        }
+    }
+
+    fn tick(&mut self, summary: &RolloutReconcileSummary) {
+        if self.total_files == 0 {
+            return;
+        }
+        self.visited_files += 1;
+        let now = Instant::now();
+        let should_print = self.visited_files == 1
+            || self.visited_files == self.total_files
+            || now.duration_since(self.last_print_at) >= ROLLOUT_PROGRESS_INTERVAL;
+        if should_print {
+            self.print(summary, false);
+            self.last_print_at = now;
+        }
+    }
+
+    fn finish(&mut self, summary: &RolloutReconcileSummary) {
+        if self.total_files == 0 {
+            return;
+        }
+        self.print(summary, true);
+    }
+
+    fn print(&mut self, summary: &RolloutReconcileSummary, final_line: bool) {
+        let message = rollout_progress_message(
+            self.config.locale,
+            self.visited_files,
+            self.total_files,
+            summary.checked_files,
+            summary.changed_files,
+            summary.prepared_files,
+            summary.skipped_files,
+            self.started_at.elapsed(),
+        );
+        let mut stderr = std::io::stderr();
+        if self.is_terminal {
+            let _ = write!(stderr, "\r{message}\x1b[K");
+            if final_line {
+                let _ = writeln!(stderr);
+            }
+        } else if final_line || !self.printed {
+            let _ = writeln!(stderr, "{message}");
+        }
+        let _ = stderr.flush();
+        self.printed = true;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -259,14 +339,21 @@ fn main() -> Result<()> {
             print_status(locale, &summary);
         }
         Command::Sync { sqlite_only } => {
-            let summary = reconcile_once_with_backup(
+            let rollout_scope = if sqlite_only {
+                RolloutScope::None
+            } else {
+                RolloutScope::AllRows
+            };
+            let progress = if sqlite_only {
+                None
+            } else {
+                Some(RolloutProgressConfig { locale })
+            };
+            let summary = reconcile_once_with_backup_progress(
                 &codex_home,
                 cli.provider.as_deref(),
-                if sqlite_only {
-                    RolloutScope::None
-                } else {
-                    RolloutScope::AllRows
-                },
+                rollout_scope,
+                progress,
             )?;
             print_sync_summary(locale, sync_complete_title(locale), &summary);
         }
@@ -289,6 +376,7 @@ fn main() -> Result<()> {
                     provider.as_deref(),
                     RolloutScope::AllRows,
                     padding_bytes,
+                    Some(RolloutProgressConfig { locale }),
                 )?;
                 print_sync_summary(locale, bucket_switch_complete_title(locale), &summary);
             }
@@ -753,19 +841,29 @@ fn reconcile_once(
     provider_override: Option<&str>,
     rollout_scope: RolloutScope,
 ) -> Result<ReconcileSummary> {
+    reconcile_once_with_progress(codex_home, provider_override, rollout_scope, None)
+}
+
+fn reconcile_once_with_progress(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    rollout_scope: RolloutScope,
+    progress: Option<RolloutProgressConfig>,
+) -> Result<ReconcileSummary> {
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
         None => read_provider_from_config(codex_home)?,
     };
     let sqlite_path = codex_home.join("state_5.sqlite");
     let started = Instant::now();
-    let rollout_summary = reconcile_rollout_metadata_from_sqlite(
+    let rollout_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
         &sqlite_path,
         codex_home,
         provider.as_str(),
         rollout_scope,
         None,
         DEFAULT_BUCKET_PADDING_BYTES,
+        progress,
     )?;
     let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
 
@@ -783,16 +881,18 @@ fn reconcile_once(
     })
 }
 
-fn reconcile_once_with_backup(
+fn reconcile_once_with_backup_progress(
     codex_home: &Path,
     provider_override: Option<&str>,
     rollout_scope: RolloutScope,
+    progress: Option<RolloutProgressConfig>,
 ) -> Result<ReconcileSummary> {
     reconcile_once_with_backup_and_padding(
         codex_home,
         provider_override,
         rollout_scope,
         DEFAULT_BUCKET_PADDING_BYTES,
+        progress,
     )
 }
 
@@ -801,6 +901,7 @@ fn reconcile_once_with_backup_and_padding(
     provider_override: Option<&str>,
     rollout_scope: RolloutScope,
     padding_bytes: usize,
+    progress: Option<RolloutProgressConfig>,
 ) -> Result<ReconcileSummary> {
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
@@ -820,13 +921,14 @@ fn reconcile_once_with_backup_and_padding(
                     .and_then(|name| name.to_str())
                     .unwrap_or("state_5.sqlite.bak")
             ));
-    let rollout_summary = reconcile_rollout_metadata_from_sqlite(
+    let rollout_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
         &sqlite_path,
         codex_home,
         provider.as_str(),
         rollout_scope,
         Some(rollout_journal_path.as_path()),
         padding_bytes,
+        progress,
     )?;
     let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
 
@@ -860,19 +962,26 @@ fn read_provider_from_config(codex_home: &Path) -> Result<String> {
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()))
 }
 
-fn reconcile_rollout_metadata_from_sqlite(
+fn reconcile_rollout_metadata_from_sqlite_with_progress(
     sqlite_path: &Path,
     _codex_home: &Path,
     provider: &str,
     scope: RolloutScope,
     journal_path: Option<&Path>,
     padding_bytes: usize,
+    progress: Option<RolloutProgressConfig>,
 ) -> Result<RolloutReconcileSummary> {
     if scope == RolloutScope::None {
         return Ok(RolloutReconcileSummary::default());
     }
     let targets = rollout_targets_for_scope(sqlite_path, provider, scope)?;
-    reconcile_rollout_metadata_files(targets.as_slice(), provider, journal_path, padding_bytes)
+    reconcile_rollout_metadata_files(
+        targets.as_slice(),
+        provider,
+        journal_path,
+        padding_bytes,
+        progress,
+    )
 }
 
 fn rollout_targets_for_scope(
@@ -919,11 +1028,16 @@ fn reconcile_rollout_metadata_files(
     provider: &str,
     journal_path: Option<&Path>,
     padding_bytes: usize,
+    progress: Option<RolloutProgressConfig>,
 ) -> Result<RolloutReconcileSummary> {
     let mut summary = RolloutReconcileSummary::default();
     let mut journal = journal_path.map(|path| RolloutChangeJournal::new(path.to_path_buf()));
+    let mut progress = progress.map(|config| RolloutProgress::new(config, targets.len() as u64));
     for target in targets {
         if !target.path.exists() {
+            if let Some(progress) = progress.as_mut() {
+                progress.tick(&summary);
+            }
             continue;
         }
         summary.checked_files += 1;
@@ -938,6 +1052,12 @@ fn reconcile_rollout_metadata_files(
         if outcome.skipped {
             summary.skipped_files += 1;
         }
+        if let Some(progress) = progress.as_mut() {
+            progress.tick(&summary);
+        }
+    }
+    if let Some(progress) = progress.as_mut() {
+        progress.finish(&summary);
     }
     if let Some(journal) = journal {
         summary.journal_path = journal.finish()?;
@@ -1134,16 +1254,20 @@ fn parse_matching_session_meta(line: &[u8], thread_id: &str) -> Result<Option<Va
 }
 
 fn patch_first_line_in_place(path: &Path, replacement: &[u8], newline: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    file.seek(SeekFrom::Start(0))
-        .with_context(|| format!("failed to seek {}", path.display()))?;
-    file.write_all(replacement)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    file.write_all(newline)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    let original_times = capture_file_times(path)?;
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("failed to seek {}", path.display()))?;
+        file.write_all(replacement)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.write_all(newline)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    restore_file_times(path, original_times)?;
     Ok(())
 }
 
@@ -1159,6 +1283,7 @@ fn rewrite_first_line_atomically(path: &Path, replacement: &[u8], newline: &[u8]
     ));
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let original_times = file_times_from_metadata(&metadata);
 
     {
         let input =
@@ -1198,8 +1323,27 @@ fn rewrite_first_line_atomically(path: &Path, replacement: &[u8], newline: &[u8]
             temp_path.display()
         )
     })?;
+    restore_file_times(path, original_times)?;
     sync_dir(parent)?;
     Ok(())
+}
+
+fn capture_file_times(path: &Path) -> Result<(FileTime, FileTime)> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    Ok(file_times_from_metadata(&metadata))
+}
+
+fn file_times_from_metadata(metadata: &fs::Metadata) -> (FileTime, FileTime) {
+    (
+        FileTime::from_last_access_time(metadata),
+        FileTime::from_last_modification_time(metadata),
+    )
+}
+
+fn restore_file_times(path: &Path, times: (FileTime, FileTime)) -> Result<()> {
+    set_file_times(path, times.0, times.1)
+        .with_context(|| format!("failed to restore file times for {}", path.display()))
 }
 
 fn record_rollout_change(
@@ -1582,6 +1726,28 @@ fn print_status(locale: Locale, summary: &StatusSummary) {
         status_loaded_label(locale),
         yes_no(locale, summary.service_status.running)
     );
+}
+
+fn rollout_progress_message(
+    locale: Locale,
+    visited_files: u64,
+    total_files: u64,
+    checked_files: u64,
+    changed_files: u64,
+    prepared_files: u64,
+    skipped_files: u64,
+    elapsed: Duration,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "Rollouts: scanned {visited_files}/{total_files}, checked {checked_files}, updated {changed_files}, prepared {prepared_files}, skipped {skipped_files}, elapsed {} ms",
+            elapsed.as_millis()
+        ),
+        Locale::ZhHans => format!(
+            "rollout 进度: 已扫描 {visited_files}/{total_files}，已检查 {checked_files}，已更新 {changed_files}，已准备 {prepared_files}，已跳过 {skipped_files}，耗时 {} ms",
+            elapsed.as_millis()
+        ),
+    }
 }
 
 fn print_sync_summary(locale: Locale, title: &str, summary: &ReconcileSummary) {
@@ -2331,7 +2497,7 @@ mod tests {
     use super::parse_locale_tag;
     use super::read_provider_from_config;
     use super::reconcile_once;
-    use super::reconcile_rollout_metadata_from_sqlite;
+    use super::reconcile_rollout_metadata_from_sqlite_with_progress;
     use super::reconcile_sqlite_in_place;
     use super::reconcile_sqlite_with_backup;
     use super::validate_provider_override;
@@ -2340,6 +2506,8 @@ mod tests {
     use anyhow::Result;
     use clap::FromArgMatches;
     use clap::error::ErrorKind;
+    use filetime::FileTime;
+    use filetime::set_file_times;
     use rusqlite::Connection;
     use std::fs;
     use std::path::Path;
@@ -2550,6 +2718,8 @@ mod tests {
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
             ),
         )?;
+        let original_mtime = FileTime::from_unix_time(1_700_000_000, 0);
+        set_file_times(&rollout_path, original_mtime, original_mtime)?;
         seed_sqlite(&sqlite_path)?;
         let connection = Connection::open(&sqlite_path)?;
         connection.execute(
@@ -2559,13 +2729,14 @@ mod tests {
         drop(connection);
 
         let journal_path = codex_home.join("backups/rollouts.test.jsonl");
-        let summary = reconcile_rollout_metadata_from_sqlite(
+        let summary = reconcile_rollout_metadata_from_sqlite_with_progress(
             &sqlite_path,
             codex_home,
             "openai",
             RolloutScope::AllRows,
             Some(journal_path.as_path()),
             DEFAULT_BUCKET_PADDING_BYTES,
+            None,
         )?;
 
         let rewritten = fs::read_to_string(&rollout_path)?;
@@ -2578,6 +2749,7 @@ mod tests {
         assert!(rewritten.contains("\"model_provider\":\"cong\""));
         assert!(journal.contains("\"mode\":\"rewrite_with_padding\""));
         assert!(journal.contains("cong"));
+        assert_rollout_mtime(&rollout_path, original_mtime)?;
         Ok(())
     }
 
@@ -2596,6 +2768,8 @@ mod tests {
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
             ),
         )?;
+        let original_mtime = FileTime::from_unix_time(1_700_000_100, 0);
+        set_file_times(&rollout_path, original_mtime, original_mtime)?;
         seed_sqlite(&sqlite_path)?;
         let connection = Connection::open(&sqlite_path)?;
         connection.execute(
@@ -2606,13 +2780,14 @@ mod tests {
         let before_len = fs::metadata(&rollout_path)?.len();
 
         let journal_path = codex_home.join("backups/rollouts.in-place.jsonl");
-        let summary = reconcile_rollout_metadata_from_sqlite(
+        let summary = reconcile_rollout_metadata_from_sqlite_with_progress(
             &sqlite_path,
             codex_home,
             "cong",
             RolloutScope::AllRows,
             Some(journal_path.as_path()),
             DEFAULT_BUCKET_PADDING_BYTES,
+            None,
         )?;
 
         let after_len = fs::metadata(&rollout_path)?.len();
@@ -2630,6 +2805,7 @@ mod tests {
                 .contains("\"model_provider\":\"cong\"")
         );
         assert!(journal.contains("\"mode\":\"in_place\""));
+        assert_rollout_mtime(&rollout_path, original_mtime)?;
         Ok(())
     }
 
@@ -2723,6 +2899,12 @@ mod tests {
                 ('3', '/tmp/c', 1, 1, 'cli', 'openai', '/tmp', 'c', 'workspace-write', 'auto');
             ",
         )?;
+        Ok(())
+    }
+
+    fn assert_rollout_mtime(path: &Path, expected: FileTime) -> Result<()> {
+        let actual = FileTime::from_last_modification_time(&fs::metadata(path)?);
+        assert_eq!(actual.unix_seconds(), expected.unix_seconds());
         Ok(())
     }
 }

@@ -121,8 +121,9 @@ codex-threadripper install-service
 ## 它会改什么
 
 - `sync` 会在 `CODEX_HOME/backups/` 里创建备份，然后更新 `state_5.sqlite` 里的 `model_provider` 字段
-- `watch` 在运行期间会持续处理新写入的线程记录，保持数据库与当前 provider 对齐
-- 工具不会动 rollout 文件，每条线程原本是用哪个 provider 创建的，仍然可以从源文件里追溯
+- `sync` / `bucket switch` 也会按需改写 rollout JSONL 首行里的 provider 可见桶，并写入 compact journal；改写后会恢复原本的文件访问时间和修改时间，避免 Codex.app 的最近会话排序被工具污染
+- `watch` 在运行期间会持续处理新写入的线程记录，保持数据库与 rollout 首行里的 provider 可见桶和当前 provider 对齐
+- `--sqlite-only` 只更新 SQLite，适合只关心数据库索引的场景；当前 Codex.app 也会读取 rollout JSONL 元数据，所以日常可见性修复不建议使用它
 
 ## 平台支持
 
@@ -234,8 +235,9 @@ These legacy command names still work:
 ## What it changes
 
 - `sync` writes a backup and then updates the `model_provider` column in `state_5.sqlite`
-- `watch` keeps that column aligned with the active provider as new threads are written
-- Rollout files are never touched, so you can always trace a thread back to its original provider if you need to
+- `sync` / `bucket switch` also rewrite the provider visibility bucket in rollout JSONL first lines when needed and write a compact journal; after each rewrite, the original file access and modification times are restored so Codex.app's recent-thread ordering is not polluted by the tool
+- `watch` keeps both SQLite and rollout first-line provider buckets aligned with the active provider as new threads are written
+- `--sqlite-only` updates SQLite only. Use it only when you deliberately do not need rollout JSONL metadata; current Codex.app builds also read rollout metadata for visibility
 
 ## Platforms
 

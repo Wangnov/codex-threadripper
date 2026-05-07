@@ -27,6 +27,7 @@ eula = false
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 ctrlc = "3.4"
+filetime = "0.2"
 fs2 = "0.4.3"
 notify = "8.2"
 rusqlite = { version = "0.32", features = ["backup", "bundled"] }
