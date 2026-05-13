@@ -95,6 +95,7 @@ enum Command {
     Sync {
         #[arg(long, help = "placeholder")]
         sqlite_only: bool,
+        #[arg(long, help = "placeholder")]
         dry_run: bool,
     },
     /// placeholder
@@ -369,6 +370,20 @@ fn main() -> Result<()> {
             } else {
                 Some(RolloutProgressConfig { locale })
             };
+            if dry_run {
+                let sqlite_path = resolve_sqlite_path(&codex_home)?;
+                let provider = match cli.provider.as_deref() {
+                    Some(provider) => provider.to_string(),
+                    None => read_provider_from_config(&codex_home)?,
+                };
+                let (total_rows, mismatched_rows, _distribution) =
+                    inspect_sqlite_distribution(&sqlite_path, provider.as_str())?;
+                println!("{}", dry_run_label(locale));
+                println!("  Provider: {}", provider);
+                println!("  Total threads: {}", total_rows);
+                println!("  Threads needing update: {}", mismatched_rows);
+                println!("  Backup: skipped (dry run)");
+            } else {
             let summary = reconcile_once_with_backup_progress(
                 &codex_home,
                 cli.provider.as_deref(),
@@ -376,6 +391,7 @@ fn main() -> Result<()> {
                 progress,
             )?;
             print_sync_summary(locale, sync_complete_title(locale), &summary);
+            }
         }
         Command::Bucket { command } => match command {
             BucketCommand::Prepare { padding_bytes } => {
@@ -1625,7 +1641,7 @@ fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> Result<(u64,
 
 
 fn list_backup_files(codex_home: &Path) -> Result<Vec<PathBuf>> {
-    let sqlite_path = resolve_sqlite_path(codex_home);
+    let sqlite_path = resolve_sqlite_path(codex_home)?;
     let backups_dir = sqlite_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -1662,7 +1678,7 @@ struct PruneSummary {
 }
 
 fn run_restore(codex_home: &Path, backup_arg: Option<&Path>, dry_run: bool) -> Result<RestoreSummary> {
-    let sqlite_path = resolve_sqlite_path(codex_home);
+    let sqlite_path = resolve_sqlite_path(codex_home)?;
 
     let backup_path = match backup_arg {
         Some(path) => {
@@ -1763,8 +1779,6 @@ fn print_prune_summary(locale: Locale, summary: &PruneSummary) {
         println!("  Removed: {}", summary.removed);
     }
 }
-
-# Need to wrap the 50-session warning to not break background service display
 
 #[cfg(test)]
 fn reconcile_sqlite_with_backup(sqlite_path: &Path, provider: &str) -> Result<(u64, u64, PathBuf)> {
