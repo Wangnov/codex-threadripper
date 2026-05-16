@@ -106,7 +106,7 @@ codex-threadripper install-service
 - `bucket switch <provider>`：把全部历史切到指定 provider 可见桶；首行有 padding 时只做原地 patch
 - `bucket prepare`：给 rollout 首行补足 JSON 空白 padding，让后续 provider 桶切换保持快速
 - `watch`：持续监听 `config.toml` 的变化，同时定时收敛新增的线程记录
-- `print-service-config`：打印当前平台的后台服务配置内容（launchd plist / systemd unit / Windows 启动脚本）
+- `print-service-config`：打印当前平台的后台服务配置内容（launchd plist / systemd unit / Windows 隐藏 VBS 启动器）
 - `install-service`：把后台服务装到系统里并立即启动
 - `uninstall-service`：停止并卸载后台服务
 
@@ -131,7 +131,7 @@ codex-threadripper install-service
 - `status`、`sync`、`watch` 在任何能访问 Codex SQLite 状态库和 rollout JSONL 的环境下都能用
 - macOS 后台服务使用 `launchd`
 - Linux 后台服务使用 `systemd --user`（没有 systemd 时会退回到独立的后台进程）
-- Windows 后台服务使用启动文件夹里的批处理脚本
+- Windows 后台服务使用启动文件夹里的隐藏 VBS 启动器，登录后不会弹出控制台窗口
 - 发布的二进制覆盖 Apple Silicon macOS、Intel macOS、Linux x64、Linux ARM64、Windows x64
 - CLI 界面同时支持简体中文和英文，根据系统语言自动切换
 
@@ -221,7 +221,7 @@ codex-threadripper install-service
 - `bucket switch <provider>`: move all history into the requested provider visibility bucket; prepared first lines are patched in place
 - `bucket prepare`: reserve JSON whitespace padding in rollout first lines so future provider bucket switches stay fast
 - `watch`: keep watching `config.toml` for provider changes and periodically reconcile any newly added thread rows
-- `print-service-config`: print the platform-specific service config (launchd plist, systemd unit, or Windows startup script) without installing it
+- `print-service-config`: print the platform-specific service config (launchd plist, systemd unit, or Windows hidden VBS launcher) without installing it
 - `install-service`: write the service config and start the service
 - `uninstall-service`: stop and remove the service
 
@@ -246,7 +246,7 @@ These legacy command names still work:
 - `status`, `sync`, and `watch` work anywhere you can access Codex's SQLite state DB and rollout JSONL files
 - macOS uses `launchd`
 - Linux uses `systemd --user`, falling back to a detached process when systemd isn't available
-- Windows uses a startup folder script
+- Windows uses a hidden VBS launcher in the Startup folder, so no console window appears on login
 - Prebuilt binaries are available for Apple Silicon macOS, Intel macOS, Linux x64, Linux ARM64, and Windows x64
 - The CLI detects your system language and switches between Simplified Chinese and English automatically
 

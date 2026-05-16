@@ -60,7 +60,12 @@ pub fn current_service_status() -> Result<ServiceStatus> {
     let manager = current_manager();
     let codex_home = current_codex_home()?;
     let config_path = service_config_path(manager)?;
-    let installed = config_path.exists();
+    let installed = match manager {
+        ServiceManager::WindowsStartup => {
+            config_path.exists() || legacy_windows_startup_cmd_path()?.exists()
+        }
+        _ => config_path.exists(),
+    };
     let running = service_running(manager, &codex_home)?;
     Ok(ServiceStatus {
         manager,
@@ -123,7 +128,7 @@ pub fn render_service_config(
         ServiceManager::SystemdUser => {
             build_systemd_bundle(exe_path, codex_home, provider_override, poll_interval)
         }
-        ServiceManager::WindowsStartup => Ok(build_windows_startup_script(
+        ServiceManager::WindowsStartup => Ok(build_windows_startup_vbs(
             exe_path,
             codex_home,
             provider_override,
@@ -297,8 +302,13 @@ fn install_windows_startup(
     })?;
     std::fs::create_dir_all(config_dir)?;
 
-    let script =
-        build_windows_startup_script(exe_path, codex_home, provider_override, poll_interval);
+    let legacy_cmd_path = legacy_windows_startup_cmd_path()?;
+    if legacy_cmd_path.exists() {
+        std::fs::remove_file(&legacy_cmd_path)
+            .with_context(|| format!("failed to remove {}", legacy_cmd_path.display()))?;
+    }
+
+    let script = build_windows_startup_vbs(exe_path, codex_home, provider_override, poll_interval);
     std::fs::write(&config_path, script)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
@@ -316,6 +326,13 @@ fn uninstall_windows_startup(config_path: &Path) -> Result<()> {
         std::fs::remove_file(config_path)
             .with_context(|| format!("failed to remove {}", config_path.display()))?;
     }
+
+    let legacy_cmd_path = legacy_windows_startup_cmd_path()?;
+    if legacy_cmd_path.exists() {
+        std::fs::remove_file(&legacy_cmd_path)
+            .with_context(|| format!("failed to remove {}", legacy_cmd_path.display()))?;
+    }
+
     Ok(())
 }
 
@@ -341,9 +358,13 @@ fn service_config_path(manager: ServiceManager) -> Result<PathBuf> {
             .join(".config/systemd/user")
             .join(format!("{SERVICE_LABEL}.service"))),
         ServiceManager::WindowsStartup => {
-            Ok(windows_startup_dir()?.join(format!("{SERVICE_LABEL}.cmd")))
+            Ok(windows_startup_dir()?.join(format!("{SERVICE_LABEL}.vbs")))
         }
     }
+}
+
+fn legacy_windows_startup_cmd_path() -> Result<PathBuf> {
+    Ok(windows_startup_dir()?.join(format!("{SERVICE_LABEL}.cmd")))
 }
 
 fn linux_runner_script_path() -> Result<PathBuf> {
@@ -393,21 +414,26 @@ fn build_linux_runner_script(
     )
 }
 
-fn build_windows_startup_script(
+fn build_windows_startup_vbs(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
     poll_interval: Duration,
 ) -> String {
-    format!(
-        "@echo off\r\nstart \"\" /B {}\r\n",
+    let command = format!(
+        "cmd.exe /c {}",
         watch_command_line(
             exe_path,
             codex_home,
             provider_override,
             poll_interval,
             ShellFlavor::Cmd
-        )
+        ),
+    );
+
+    format!(
+        "Set shell = CreateObject(\"WScript.Shell\")\r\nshell.Run {}, 0, False\r\n",
+        vbs_quote(&command)
     )
 }
 
@@ -980,6 +1006,10 @@ fn windows_quote(input: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+fn vbs_quote(input: &str) -> String {
+    format!("\"{}\"", input.replace('"', "\"\""))
+}
+
 fn xml_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -1019,7 +1049,10 @@ enum ProcessStatus {
 
 #[cfg(test)]
 mod tests {
+    use super::build_windows_startup_vbs;
     use super::windows_quote;
+    use std::path::Path;
+    use std::time::Duration;
 
     #[test]
     fn windows_quote_escapes_shell_metacharacters() {
@@ -1032,5 +1065,20 @@ mod tests {
             r#""C:\tmp\100%% done\x.exe""#
         );
         assert_eq!(windows_quote(r"C:\tmp\a&b\x.exe"), r#""C:\tmp\a^&b\x.exe""#);
+    }
+
+    #[test]
+    fn windows_startup_vbs_hides_console_window() {
+        let script = build_windows_startup_vbs(
+            Path::new(r"C:\Program Files\codex-threadripper\codex-threadripper.exe"),
+            Path::new(r"C:\Users\admin\.codex"),
+            Some("my"),
+            Duration::from_millis(1500),
+        );
+
+        assert!(script.contains(r#"CreateObject("WScript.Shell")"#));
+        assert!(script.contains("shell.Run"));
+        assert!(script.contains(", 0, False"));
+        assert!(script.contains("watch --poll-interval-ms 1500"));
     }
 }
