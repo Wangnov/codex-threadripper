@@ -882,10 +882,16 @@ fn codex_home_tag(codex_home: &Path) -> String {
 }
 
 fn default_codex_home() -> PathBuf {
-    std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".codex")
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            Some(PathBuf::from(drive).join(path))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".codex")
 }
 
 #[cfg(target_os = "linux")]
