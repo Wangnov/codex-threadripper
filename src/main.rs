@@ -95,6 +95,8 @@ enum Command {
     Sync {
         #[arg(long, help = "placeholder")]
         sqlite_only: bool,
+        #[arg(long, help = "placeholder")]
+        dry_run: bool,
     },
     /// placeholder
     Bucket {
@@ -139,6 +141,21 @@ enum Command {
     /// placeholder
     #[command(name = "uninstall-service", alias = "uninstall-launchd")]
     UninstallService,
+    /// placeholder
+    Restore {
+        #[arg(value_name = "BACKUP")]
+        backup: Option<PathBuf>,
+        #[arg(long, help = "placeholder")]
+        dry_run: bool,
+    },
+    /// placeholder
+    #[command(name = "prune-backups")]
+    PruneBackups {
+        #[arg(long, default_value_t = 5, value_name = "N", help = "placeholder")]
+        keep: usize,
+        #[arg(long, help = "placeholder")]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -197,6 +214,7 @@ struct StatusSummary {
     mismatched_rows: u64,
     distribution: ProviderDistribution,
     service_status: BackgroundServiceStatus,
+    exceeds_desktop_cap: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,7 +359,7 @@ fn main() -> Result<()> {
             let summary = collect_status(&codex_home, cli.provider.as_deref())?;
             print_status(locale, &summary);
         }
-        Command::Sync { sqlite_only } => {
+        Command::Sync { sqlite_only, dry_run } => {
             let rollout_scope = if sqlite_only {
                 RolloutScope::None
             } else {
@@ -352,6 +370,20 @@ fn main() -> Result<()> {
             } else {
                 Some(RolloutProgressConfig { locale })
             };
+            if dry_run {
+                let sqlite_path = resolve_sqlite_path(&codex_home)?;
+                let provider = match cli.provider.as_deref() {
+                    Some(provider) => provider.to_string(),
+                    None => read_provider_from_config(&codex_home)?,
+                };
+                let (total_rows, mismatched_rows, _distribution) =
+                    inspect_sqlite_distribution(&sqlite_path, provider.as_str())?;
+                println!("{}", dry_run_label(locale));
+                println!("  Provider: {}", provider);
+                println!("  Total threads: {}", total_rows);
+                println!("  Threads needing update: {}", mismatched_rows);
+                println!("  Backup: skipped (dry run)");
+            } else {
             let summary = reconcile_once_with_backup_progress(
                 &codex_home,
                 cli.provider.as_deref(),
@@ -359,6 +391,7 @@ fn main() -> Result<()> {
                 progress,
             )?;
             print_sync_summary(locale, sync_complete_title(locale), &summary);
+            }
         }
         Command::Bucket { command } => match command {
             BucketCommand::Prepare { padding_bytes } => {
@@ -417,6 +450,14 @@ fn main() -> Result<()> {
                 cli.provider.as_deref(),
                 Duration::from_millis(poll_interval_ms),
             )?;
+        }
+        Command::Restore { backup, dry_run } => {
+            let summary = run_restore(&codex_home, backup.as_deref(), dry_run)?;
+            print_restore_summary(locale, &summary);
+        }
+        Command::PruneBackups { keep, dry_run } => {
+            let summary = run_prune_backups(&codex_home, keep, dry_run)?;
+            print_prune_summary(locale, &summary);
         }
         Command::UninstallService => {
             uninstall_service(locale, &codex_home)?;
@@ -614,6 +655,39 @@ fn localized_command(locale: Locale) -> clap::Command {
             .disable_version_flag(true)
             .disable_help_subcommand(true)
             .help_template(help_template(locale))
+    });
+    command = command.mut_subcommand("restore", |sub| {
+        sub.about(restore_about(locale))
+            .version(APP_VERSION)
+            .disable_help_flag(true)
+            .disable_version_flag(true)
+            .disable_help_subcommand(true)
+            .help_template(help_template(locale))
+            .mut_arg("backup", |arg| {
+                arg.help(restore_backup_help(locale))
+                    .value_name("BACKUP")
+            })
+            .mut_arg("dry_run", |arg| {
+                arg.help(dry_run_help(locale))
+                    .help_heading(options_heading(locale))
+            })
+    });
+    command = command.mut_subcommand("prune-backups", |sub| {
+        sub.about(prune_backups_about(locale))
+            .version(APP_VERSION)
+            .disable_help_flag(true)
+            .disable_version_flag(true)
+            .disable_help_subcommand(true)
+            .help_template(help_template(locale))
+            .mut_arg("keep", |arg| {
+                arg.help(prune_backups_keep_help(locale))
+                    .help_heading(options_heading(locale))
+                    .value_name("N")
+            })
+            .mut_arg("dry_run", |arg| {
+                arg.help(dry_run_help(locale))
+                    .help_heading(options_heading(locale))
+            })
     });
 
     command
@@ -836,6 +910,7 @@ fn collect_status(codex_home: &Path, provider_override: Option<&str>) -> Result<
         mismatched_rows,
         distribution,
         service_status,
+        exceeds_desktop_cap: total_rows > 50,
     })
 }
 
@@ -1564,6 +1639,147 @@ fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> Result<(u64,
     Ok((changed_rows, total_rows))
 }
 
+
+fn list_backup_files(codex_home: &Path) -> Result<Vec<PathBuf>> {
+    let sqlite_path = resolve_sqlite_path(codex_home)?;
+    let backups_dir = sqlite_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("backups");
+
+    if !backups_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut backups: Vec<PathBuf> = fs::read_dir(&backups_dir)
+        .with_context(|| format!("failed to read {}", backups_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().and_then(|e| e.to_str()) == Some("bak")
+        })
+        .collect();
+
+    backups.sort_by(|a, b| {
+        b.metadata().and_then(|m| m.created()).ok()
+            .cmp(&a.metadata().and_then(|m| m.created()).ok())
+    });
+
+    Ok(backups)
+}
+
+struct RestoreSummary {
+    backup_path: PathBuf,
+}
+
+struct PruneSummary {
+    removed: usize,
+    kept: usize,
+}
+
+fn run_restore(codex_home: &Path, backup_arg: Option<&Path>, dry_run: bool) -> Result<RestoreSummary> {
+    let sqlite_path = resolve_sqlite_path(codex_home)?;
+
+    let backup_path = match backup_arg {
+        Some(path) => {
+            if !path.exists() {
+                anyhow::bail!("Backup file not found: {}", path.display());
+            }
+            path.to_path_buf()
+        }
+        None => {
+            let backups = list_backup_files(codex_home)?;
+            if backups.is_empty() {
+                anyhow::bail!("No backups found in the backups directory.");
+            }
+            println!("Available backups:");
+            for (i, b) in backups.iter().enumerate() {
+                let size = fs::metadata(b).map(|m| m.len()).unwrap_or(0);
+                let modified = b.metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|t| {
+                        let duration = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+                        duration.as_secs()
+                    })
+                    .unwrap_or(0);
+                println!("  {}. {} ({} bytes, modified {})", i + 1, b.display(), size, modified);
+            }
+            if let Some(backup) = backups.first() {
+                println!("\nUse: codex-threadripper restore <BACKUP_PATH>");
+                backup.clone()
+            } else {
+                anyhow::bail!("No .bak backup files found.");
+            }
+        }
+    };
+
+    if dry_run {
+        println!("{} Would restore SQLite from: {}", dry_run_label(Locale::En), backup_path.display());
+        return Ok(RestoreSummary { backup_path });
+    }
+
+    // Close any existing connection to the DB before restoring
+    fs::copy(&backup_path, &sqlite_path)
+        .with_context(|| format!("failed to restore {} from {}", sqlite_path.display(), backup_path.display()))?;
+
+    println!("{}", restore_backup_path_label(detect_locale()));
+    println!("  {}", backup_path.display());
+
+    Ok(RestoreSummary { backup_path })
+}
+
+fn run_prune_backups(codex_home: &Path, keep: usize, dry_run: bool) -> Result<PruneSummary> {
+    let backups = list_backup_files(codex_home)?;
+    let kept = backups.len().min(keep);
+    let to_remove: Vec<&PathBuf> = backups.iter().skip(kept).collect();
+    let removed = to_remove.len();
+
+    if removed == 0 {
+        println!("No old backups to prune ({} total, keeping {})", backups.len(), keep);
+        return Ok(PruneSummary { removed: 0, kept: backups.len() });
+    }
+
+    if dry_run {
+        println!("{} Would remove {} old backup(s), keep {}:", dry_run_label(Locale::En), removed, keep);
+        for b in &to_remove {
+            println!("  would remove: {}", b.display());
+        }
+    } else {
+        for b in &to_remove {
+            fs::remove_file(b)
+                .with_context(|| format!("failed to remove {}", b.display()))?;
+        }
+    }
+
+    println!("  {}: {}", prune_backups_removed_label(detect_locale()), removed);
+    println!("  {}: {}", prune_backups_kept_label(detect_locale()), kept);
+
+    Ok(PruneSummary { removed, kept })
+}
+
+fn print_restore_summary(locale: Locale, summary: &RestoreSummary) {
+    if locale == Locale::ZhHans {
+        println!("{}", restore_complete_title(locale));
+        println!("  SQLite 已从 {} 恢复", summary.backup_path.display());
+    } else {
+        println!("{}", restore_complete_title(locale));
+        println!("  SQLite restored from {}", summary.backup_path.display());
+    }
+}
+
+fn print_prune_summary(locale: Locale, summary: &PruneSummary) {
+    if locale == Locale::ZhHans {
+        println!("{}", prune_backups_kept_label(locale));
+        println!("  已保留: {}", summary.kept);
+        println!("  已删除: {}", summary.removed);
+    } else {
+        println!("{}", prune_backups_kept_label(locale));
+        println!("  Kept: {}", summary.kept);
+        println!("  Removed: {}", summary.removed);
+    }
+}
+
 #[cfg(test)]
 fn reconcile_sqlite_with_backup(sqlite_path: &Path, provider: &str) -> Result<(u64, u64, PathBuf)> {
     let backup_path = create_sqlite_backup_file(sqlite_path)?;
@@ -1761,6 +1977,11 @@ fn print_status(locale: Locale, summary: &StatusSummary) {
     println!("{}", status_distribution_heading(locale));
     for (provider, count) in &summary.distribution {
         println!("  {provider}: {count}");
+    }
+    if summary.exceeds_desktop_cap {
+        println!();
+        println!("{}", status_desktop_cap_heading(locale));
+        println!("  {}", status_desktop_cap_warning(locale, summary.total_rows));
     }
     println!();
     println!("{}", status_background_service_heading(locale));
@@ -2386,6 +2607,91 @@ fn sqlite_missing_error(locale: Locale, path: &Path) -> String {
     }
 }
 
+fn restore_about(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Restore SQLite database from a previous backup.",
+        Locale::ZhHans => "从之前的备份恢复 SQLite 数据库。",
+    }
+}
+
+fn restore_backup_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Backup file to restore. List available backups if omitted.",
+        Locale::ZhHans => "要恢复的备份文件。省略则列出可用备份。",
+    }
+}
+
+fn prune_backups_about(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Remove old backups, keeping the N most recent.",
+        Locale::ZhHans => "删除旧备份，保留最近 N 份。",
+    }
+}
+
+fn prune_backups_keep_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Number of most recent backups to keep.",
+        Locale::ZhHans => "保留最近备份的份数。",
+    }
+}
+
+fn dry_run_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Preview changes without writing anything.",
+        Locale::ZhHans => "预览模式，只显示将发生的更改而不实际写入。",
+    }
+}
+
+fn status_desktop_cap_heading(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Desktop 50-session cap",
+        Locale::ZhHans => "Desktop 50 条上限",
+    }
+}
+
+fn status_desktop_cap_warning(locale: Locale, total: u64) -> String {
+    match locale {
+        Locale::En => format!("Total threads ({total}) exceed the 50-session cap. Some threads may not appear in the Desktop sidebar."),
+        Locale::ZhHans => format!("总线程数（{total}）超过 50 条上限，部分线程可能不会显示在 Desktop 侧栏中。"),
+    }
+}
+
+fn restore_complete_title(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Restore complete",
+        Locale::ZhHans => "恢复完成",
+    }
+}
+
+fn prune_backups_removed_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Removed",
+        Locale::ZhHans => "已删除",
+    }
+}
+
+fn prune_backups_kept_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Kept",
+        Locale::ZhHans => "已保留",
+    }
+}
+
+fn restore_backup_path_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Restored from",
+        Locale::ZhHans => "已从备份恢复",
+    }
+}
+
+fn dry_run_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "[DRY RUN]",
+        Locale::ZhHans => "[DRY RUN]",
+    }
+}
+
+
 fn status_title(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Codex Threadripper",
@@ -2539,6 +2845,7 @@ fn service_log_message(locale: Locale, path: &Path) -> String {
         Locale::ZhHans => format!("日志路径：{}", path.display()),
     }
 }
+
 
 #[cfg(test)]
 mod tests {
