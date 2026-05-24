@@ -118,6 +118,8 @@ codex-threadripper install-service
 
 `watch` 的默认轮询间隔是 500ms。`watch`、`print-service-config` 和 `install-service` 都支持 `--poll-interval-ms` 来自定义间隔。
 
+所有命令都支持 `--provider <provider>` 强制指定目标桶，或 `--profile <name>` 按 Codex v2 profile 读取 `$CODEX_HOME/<name>.config.toml` 里的 `model_provider` / `sqlite_home`。Profile 名称只能包含 ASCII 字母、数字、`_` 或 `-`。如果没有同名 profile 文件，也会兼容旧的 `[profiles.<name>]` provider 配置。
+
 ## 它会改什么
 
 - `sync` 会在 SQLite 状态库旁边的 `backups/` 目录里创建备份，然后更新 `state_5.sqlite` 里的 `model_provider` 字段
@@ -232,6 +234,8 @@ These legacy command names still work:
 - `uninstall-launchd` → `uninstall-service`
 
 `watch` polls every 500ms by default. You can change that with `--poll-interval-ms` on `watch`, `print-service-config`, and `install-service`.
+
+Every command accepts `--provider <provider>` to force the target bucket, or `--profile <name>` to resolve `model_provider` / `sqlite_home` from Codex's v2 `$CODEX_HOME/<name>.config.toml` profile. Profile names must contain only ASCII letters, digits, `_`, or `-`. If that profile file is missing, legacy `[profiles.<name>]` provider config is still supported.
 
 ## What it changes
 
