@@ -32,6 +32,8 @@ use crate::output::watcher_error_message;
 use crate::rollout::RolloutScope;
 use crate::sync::reconcile_once;
 
+pub(crate) const WATCH_FULL_ROLLOUT_POLL_INTERVALS: u64 = 120;
+
 pub(crate) fn run_watch(
     locale: Locale,
     codex_home: &Path,
@@ -99,6 +101,7 @@ pub(crate) fn run_watch(
     );
 
     let mut next_poll_deadline = Instant::now() + poll_interval;
+    let mut poll_count = 0_u64;
 
     while !shutdown.load(Ordering::Relaxed) {
         let timeout = next_poll_deadline.saturating_duration_since(Instant::now());
@@ -133,11 +136,12 @@ pub(crate) fn run_watch(
                 eprintln!("{}", watcher_error_message(locale, err));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                poll_count = poll_count.wrapping_add(1);
                 match reconcile_once(
                     codex_home,
                     provider_override.as_deref(),
                     profile_override.as_deref(),
-                    rollout_scope,
+                    periodic_watch_rollout_scope(rollout_scope, poll_count),
                 ) {
                     Ok(summary) => {
                         if last_provider.as_deref() != Some(summary.provider.as_str())
@@ -165,6 +169,16 @@ pub(crate) fn run_watch(
     }
     println!("{}", watch_stopped_message(locale));
     Ok(())
+}
+
+pub(crate) fn periodic_watch_rollout_scope(
+    rollout_scope: RolloutScope,
+    poll_count: u64,
+) -> RolloutScope {
+    if poll_count.is_multiple_of(WATCH_FULL_ROLLOUT_POLL_INTERVALS) {
+        return full_watch_rollout_scope(rollout_scope);
+    }
+    rollout_scope
 }
 
 pub(crate) fn full_watch_rollout_scope(rollout_scope: RolloutScope) -> RolloutScope {

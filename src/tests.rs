@@ -21,7 +21,9 @@ use crate::state_db::inspect_sqlite_distribution;
 use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::reconcile_sqlite_with_backup;
 use crate::sync::reconcile_once;
+use crate::watch::WATCH_FULL_ROLLOUT_POLL_INTERVALS;
 use crate::watch::full_watch_rollout_scope;
+use crate::watch::periodic_watch_rollout_scope;
 use crate::watch::watched_config_paths;
 use anyhow::Result;
 use clap::FromArgMatches;
@@ -377,6 +379,48 @@ fn seed_sqlite_fixture_includes_current_codex_thread_columns() -> Result<()> {
         assert!(columns.iter().any(|candidate| candidate == column));
     }
 
+    let mut statement = connection.prepare("PRAGMA index_list(threads)")?;
+    let indexes = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for index in [
+        "idx_threads_created_at_ms",
+        "idx_threads_updated_at_ms",
+        "idx_threads_archived_cwd_created_at_ms",
+        "idx_threads_archived_cwd_updated_at_ms",
+    ] {
+        assert!(indexes.iter().any(|candidate| candidate == index));
+    }
+
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")?;
+    let triggers = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for trigger in [
+        "threads_created_at_ms_after_insert",
+        "threads_updated_at_ms_after_insert",
+        "threads_created_at_ms_after_update",
+        "threads_updated_at_ms_after_update",
+    ] {
+        assert!(triggers.iter().any(|candidate| candidate == trigger));
+    }
+
+    connection.execute(
+        "INSERT INTO threads (
+            id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+            sandbox_policy, approval_mode
+        ) VALUES ('trigger-test', '', 2, 3, 'cli', 'openai', '/tmp', 'trigger test',
+            'workspace-write', 'auto')",
+        [],
+    )?;
+    let triggered_ms: (i64, i64) = connection.query_row(
+        "SELECT created_at_ms, updated_at_ms FROM threads WHERE id = 'trigger-test'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    assert_eq!(triggered_ms, (2000, 3000));
+
     let (created_at_ms, updated_at_ms, thread_source, preview): (
             i64,
             i64,
@@ -524,6 +568,25 @@ fn watch_promotes_initial_rollout_scan_to_all_rows() {
     );
     assert_eq!(
         full_watch_rollout_scope(RolloutScope::None),
+        RolloutScope::None
+    );
+}
+
+#[test]
+fn watch_periodically_runs_full_rollout_scan() {
+    assert_eq!(
+        periodic_watch_rollout_scope(RolloutScope::MismatchedRows, 1),
+        RolloutScope::MismatchedRows
+    );
+    assert_eq!(
+        periodic_watch_rollout_scope(
+            RolloutScope::MismatchedRows,
+            WATCH_FULL_ROLLOUT_POLL_INTERVALS
+        ),
+        RolloutScope::AllRows
+    );
+    assert_eq!(
+        periodic_watch_rollout_scope(RolloutScope::None, WATCH_FULL_ROLLOUT_POLL_INTERVALS),
         RolloutScope::None
     );
 }
