@@ -11,7 +11,7 @@ pub(crate) const STATE_DB_FILENAME: &str = "state_5.sqlite";
 const CODEX_SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
 const PROFILE_CONFIG_SUFFIX: &str = ".config.toml";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ConfigToml {
     model_provider: Option<String>,
     sqlite_home: Option<String>,
@@ -22,17 +22,6 @@ struct ConfigToml {
 #[derive(Debug, Deserialize)]
 struct ConfigProfileToml {
     model_provider: Option<String>,
-}
-
-impl Default for ConfigToml {
-    fn default() -> Self {
-        Self {
-            model_provider: None,
-            sqlite_home: None,
-            profile: None,
-            profiles: None,
-        }
-    }
 }
 
 impl ConfigToml {
