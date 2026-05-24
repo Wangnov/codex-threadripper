@@ -209,7 +209,7 @@ fn resolves_sqlite_path_from_config_sqlite_home() -> Result<()> {
     let sqlite_home = dir.path().join("custom-state");
     fs::write(
         dir.path().join("config.toml"),
-        format!("sqlite_home = \"{}\"\n", sqlite_home.display()),
+        sqlite_home_config(&sqlite_home),
     )?;
 
     let sqlite_path = resolve_sqlite_path(dir.path(), None)?;
@@ -292,7 +292,7 @@ fn reconcile_once_returns_error_when_db_missing() -> Result<()> {
     let sqlite_path = dir.path().join("state_5.sqlite");
     fs::write(
         dir.path().join("config.toml"),
-        format!("sqlite_home = \"{}\"\n", dir.path().display()),
+        sqlite_home_config(dir.path()),
     )?;
 
     let err = reconcile_once(dir.path(), Some("openai"), None, RolloutScope::None).unwrap_err();
@@ -744,6 +744,15 @@ fn seed_sqlite(path: &Path) -> Result<()> {
             ",
     )?;
     Ok(())
+}
+
+fn sqlite_home_config(path: &Path) -> String {
+    let path = path
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("sqlite_home = \"{path}\"\n")
 }
 
 fn assert_rollout_mtime(path: &Path, expected: FileTime) -> Result<()> {
