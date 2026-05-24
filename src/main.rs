@@ -3206,6 +3206,31 @@ model_provider = "local"
         for column in ["created_at_ms", "updated_at_ms", "thread_source", "preview"] {
             assert!(columns.iter().any(|candidate| candidate == column));
         }
+        let mut statement = connection.prepare("PRAGMA index_list(threads)")?;
+        let indexes = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for index in [
+            "idx_threads_created_at_ms",
+            "idx_threads_updated_at_ms",
+            "idx_threads_archived_cwd_created_at_ms",
+            "idx_threads_archived_cwd_updated_at_ms",
+        ] {
+            assert!(indexes.iter().any(|candidate| candidate == index));
+        }
+        let mut statement =
+            connection.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'")?;
+        let triggers = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for trigger in [
+            "threads_created_at_ms_after_insert",
+            "threads_updated_at_ms_after_insert",
+            "threads_created_at_ms_after_update",
+            "threads_updated_at_ms_after_update",
+        ] {
+            assert!(triggers.iter().any(|candidate| candidate == trigger));
+        }
 
         let (created_at_ms, updated_at_ms, thread_source, preview): (
             i64,
@@ -3220,6 +3245,27 @@ model_provider = "local"
         assert_eq!((created_at_ms, updated_at_ms), (1000, 1000));
         assert_eq!(thread_source, "user");
         assert_eq!(preview, "a");
+
+        connection.execute(
+            "
+            INSERT INTO threads (
+                id, rollout_path, created_at, updated_at, source, thread_source,
+                model_provider, cwd, title, sandbox_policy, approval_mode, cli_version,
+                model, reasoning_effort, first_user_message, preview
+            ) VALUES (
+                'trigger-test', '/tmp/trigger-test', 2, 3, 'cli', 'user',
+                'openai', '/tmp', 'trigger-test', 'workspace-write', 'auto',
+                '0.0.0-test', 'gpt-5-codex', 'medium', 'trigger-test', 'trigger-test'
+            )
+            ",
+            [],
+        )?;
+        let trigger_ms: (i64, i64) = connection.query_row(
+            "SELECT created_at_ms, updated_at_ms FROM threads WHERE id = 'trigger-test'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(trigger_ms, (2000, 3000));
         Ok(())
     }
 
