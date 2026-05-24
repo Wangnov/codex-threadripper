@@ -8,7 +8,11 @@ on:
 
 jobs:
   rust:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -17,4 +21,4 @@ jobs:
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: python3 -m py_compile scripts/smoke_release.py
+      - run: python -m py_compile scripts/smoke_release.py

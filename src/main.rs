@@ -53,6 +53,7 @@ const PROFILE_CONFIG_SUFFIX: &str = ".config.toml";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_BUCKET_PADDING_BYTES: usize = 256;
 const ROLLOUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+const WATCH_FULL_ROLLOUT_POLL_INTERVALS: u64 = 120;
 
 type ProviderDistribution = Vec<(String, u64)>;
 
@@ -837,6 +838,7 @@ fn run_watch(
     );
 
     let mut next_poll_deadline = Instant::now() + poll_interval;
+    let mut poll_count = 0_u64;
 
     while !shutdown.load(Ordering::Relaxed) {
         let timeout = next_poll_deadline.saturating_duration_since(Instant::now());
@@ -871,11 +873,12 @@ fn run_watch(
                 eprintln!("{}", watcher_error_message(locale, err));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                poll_count = poll_count.wrapping_add(1);
                 match reconcile_once(
                     codex_home,
                     provider_override.as_deref(),
                     profile_override.as_deref(),
-                    rollout_scope,
+                    periodic_watch_rollout_scope(rollout_scope, poll_count),
                 ) {
                     Ok(summary) => {
                         if last_provider.as_deref() != Some(summary.provider.as_str())
@@ -903,6 +906,13 @@ fn run_watch(
     }
     println!("{}", watch_stopped_message(locale));
     Ok(())
+}
+
+fn periodic_watch_rollout_scope(rollout_scope: RolloutScope, poll_count: u64) -> RolloutScope {
+    if poll_count.is_multiple_of(WATCH_FULL_ROLLOUT_POLL_INTERVALS) {
+        return full_watch_rollout_scope(rollout_scope);
+    }
+    rollout_scope
 }
 
 fn full_watch_rollout_scope(rollout_scope: RolloutScope) -> RolloutScope {
@@ -2822,6 +2832,7 @@ mod tests {
     use super::DEFAULT_POLL_INTERVAL_MS;
     use super::Locale;
     use super::RolloutScope;
+    use super::WATCH_FULL_ROLLOUT_POLL_INTERVALS;
     use super::detect_locale_from_sources;
     use super::full_watch_rollout_scope;
     use super::inspect_sqlite_distribution;
@@ -2829,6 +2840,7 @@ mod tests {
     use super::localized_command;
     use super::parse_apple_languages;
     use super::parse_locale_tag;
+    use super::periodic_watch_rollout_scope;
     use super::read_provider_from_config;
     use super::reconcile_once;
     use super::reconcile_rollout_metadata_from_sqlite_with_progress;
@@ -3313,6 +3325,25 @@ model_provider = "local"
         );
         assert_eq!(
             full_watch_rollout_scope(RolloutScope::None),
+            RolloutScope::None
+        );
+    }
+
+    #[test]
+    fn watch_periodically_runs_full_rollout_scan() {
+        assert_eq!(
+            periodic_watch_rollout_scope(RolloutScope::MismatchedRows, 1),
+            RolloutScope::MismatchedRows
+        );
+        assert_eq!(
+            periodic_watch_rollout_scope(
+                RolloutScope::MismatchedRows,
+                WATCH_FULL_ROLLOUT_POLL_INTERVALS
+            ),
+            RolloutScope::AllRows
+        );
+        assert_eq!(
+            periodic_watch_rollout_scope(RolloutScope::None, WATCH_FULL_ROLLOUT_POLL_INTERVALS),
             RolloutScope::None
         );
     }
