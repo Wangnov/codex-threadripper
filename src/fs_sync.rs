@@ -1,5 +1,6 @@
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(unix)]
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
