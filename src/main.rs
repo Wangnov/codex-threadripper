@@ -3352,13 +3352,14 @@ model_provider = "local"
 
     #[test]
     fn builds_install_next_steps() -> Result<()> {
+        let manager = crate::service::current_manager();
         let steps = install_next_steps(
             Locale::ZhHans,
             PathBuf::from("/tmp/codex threadripper").as_path(),
             PathBuf::from("/tmp/codex home").as_path(),
             Some("openai"),
             Some("work"),
-            ServiceManager::Launchd,
+            manager,
         )?;
         assert_eq!(steps.len(), 3);
         assert!(steps[0].contains("运行这条命令查看状态"));
@@ -3367,8 +3368,11 @@ model_provider = "local"
                 "'/tmp/codex threadripper' --codex-home '/tmp/codex home' --provider openai --profile work status"
             )
         );
-        assert!(steps[1].contains("launchctl print"));
-        assert!(steps[2].contains("tail -f"));
+        assert!(steps[1].contains(crate::service::manager_name(manager)));
+        match manager {
+            ServiceManager::WindowsStartup => assert!(steps[2].contains("Get-Content")),
+            _ => assert!(steps[2].contains("tail -f")),
+        }
         Ok(())
     }
 
