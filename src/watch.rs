@@ -8,6 +8,7 @@ use notify::RecursiveMode;
 use notify::Watcher;
 use std::fs::OpenOptions;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -15,6 +16,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::codex_config::selected_profile_config_path;
 use crate::locale::Locale;
 use crate::output::background_reconcile_title;
 use crate::output::config_change_title;
@@ -54,6 +56,8 @@ pub(crate) fn run_watch(
     }
 
     let config_path = codex_home.join("config.toml");
+    let mut watched_paths = watched_config_paths(codex_home, profile_override.as_deref());
+    let full_rollout_scope = full_watch_rollout_scope(rollout_scope);
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_handler = Arc::clone(&shutdown);
     ctrlc::set_handler(move || {
@@ -79,7 +83,7 @@ pub(crate) fn run_watch(
         codex_home,
         provider_override.as_deref(),
         profile_override.as_deref(),
-        rollout_scope,
+        full_rollout_scope,
     ) {
         Ok(summary) => {
             print_sync_summary(locale, watch_started_title(locale), &summary);
@@ -100,12 +104,12 @@ pub(crate) fn run_watch(
         let timeout = next_poll_deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(timeout) {
             Ok(Ok(event)) => {
-                if touches_config_file(&event, &config_path) {
+                if touches_config_file(&event, watched_paths.as_slice()) {
                     match reconcile_once(
                         codex_home,
                         provider_override.as_deref(),
                         profile_override.as_deref(),
-                        rollout_scope,
+                        full_rollout_scope,
                     ) {
                         Ok(summary) => {
                             if last_provider.as_deref() != Some(summary.provider.as_str())
@@ -115,6 +119,8 @@ pub(crate) fn run_watch(
                                 print_sync_summary(locale, config_change_title(locale), &summary);
                             }
                             last_provider = Some(summary.provider.clone());
+                            watched_paths =
+                                watched_config_paths(codex_home, profile_override.as_deref());
                         }
                         Err(err) => {
                             eprintln!("{}", watch_reconcile_skipped_message(locale, &err));
@@ -161,9 +167,30 @@ pub(crate) fn run_watch(
     Ok(())
 }
 
-fn touches_config_file(event: &notify::Event, config_path: &Path) -> bool {
+pub(crate) fn full_watch_rollout_scope(rollout_scope: RolloutScope) -> RolloutScope {
+    match rollout_scope {
+        RolloutScope::None => RolloutScope::None,
+        RolloutScope::MismatchedRows | RolloutScope::AllRows => RolloutScope::AllRows,
+    }
+}
+
+pub(crate) fn watched_config_paths(
+    codex_home: &Path,
+    profile_override: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![codex_home.join("config.toml")];
+    if let Some(profile_path) = selected_profile_config_path(codex_home, profile_override) {
+        paths.push(profile_path);
+    }
+    paths
+}
+
+fn touches_config_file(event: &notify::Event, config_paths: &[PathBuf]) -> bool {
     matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) && event.paths.iter().any(|path| path == config_path)
+    ) && event
+        .paths
+        .iter()
+        .any(|path| config_paths.iter().any(|config_path| path == config_path))
 }

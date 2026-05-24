@@ -176,7 +176,14 @@ fn install_service(
     print_install_service_summary(locale, codex_home, poll_interval, &summary);
     println!();
     println!("{}", next_steps_heading(locale));
-    for line in install_next_steps(locale, exe_path.as_path(), codex_home, summary.manager)? {
+    for line in install_next_steps(
+        locale,
+        exe_path.as_path(),
+        codex_home,
+        provider_override,
+        profile_override,
+        summary.manager,
+    )? {
         println!("{line}");
     }
     Ok(())
@@ -194,7 +201,7 @@ fn uninstall_service(locale: Locale, codex_home: &Path) -> Result<()> {
             "{}",
             run_status_next_step(
                 locale,
-                &cli_status_command(std::env::current_exe()?, codex_home)
+                &cli_status_command(std::env::current_exe()?, codex_home, None, None)
             )
         );
     } else {

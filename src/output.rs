@@ -220,10 +220,10 @@ pub(crate) fn root_about(locale: Locale) -> &'static str {
 pub(crate) fn root_long_about(locale: Locale) -> &'static str {
     match locale {
         Locale::En => {
-            "codex-threadripper is a human-first maintenance tool for Codex thread history.\n\nIt reads the active provider from CODEX_HOME/config.toml and rewrites Codex's SQLite state DB so every thread stays in the same provider bucket. The DB defaults to CODEX_HOME/state_5.sqlite, but sqlite_home and CODEX_SQLITE_HOME are respected. That makes thread lists and resume flows stop fragmenting across providers.\n\nExamples:\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
+            "codex-threadripper is a human-first maintenance tool for Codex thread history.\n\nIt reads the effective Codex provider from CODEX_HOME/config.toml, including the selected profile config when present, and rewrites Codex's SQLite state DB so every thread stays in the same provider bucket. The DB defaults to CODEX_HOME/state_5.sqlite, but sqlite_home and CODEX_SQLITE_HOME are respected. That makes thread lists and resume flows stop fragmenting across providers.\n\nExamples:\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
         }
         Locale::ZhHans => {
-            "codex-threadripper 是一个面向人的 Codex 线程历史维护工具。\n\n它会读取 CODEX_HOME/config.toml 里的当前 provider，并改写 Codex 的 SQLite 状态库，让所有线程始终落在同一个 provider 桶里。状态库默认是 CODEX_HOME/state_5.sqlite，同时会尊重 sqlite_home 和 CODEX_SQLITE_HOME。这样线程列表和 resume 流程就不会再被 provider 切碎。\n\n示例：\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
+            "codex-threadripper 是一个面向人的 Codex 线程历史维护工具。\n\n它会读取 CODEX_HOME/config.toml 和已选 profile 配置合成后的有效 provider，并改写 Codex 的 SQLite 状态库，让所有线程始终落在同一个 provider 桶里。状态库默认是 CODEX_HOME/state_5.sqlite，同时会尊重 sqlite_home 和 CODEX_SQLITE_HOME。这样线程列表和 resume 流程就不会再被 provider 切碎。\n\n示例：\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
         }
     }
 }
@@ -300,8 +300,12 @@ pub(crate) fn provider_help(locale: Locale) -> &'static str {
 
 pub(crate) fn profile_help(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Resolve model_provider and sqlite_home from a Codex profile config first.",
-        Locale::ZhHans => "优先从 Codex profile 配置解析 model_provider 和 sqlite_home。",
+        Locale::En => {
+            "Resolve model_provider and sqlite_home from a Codex profile config first. Profile names may contain ASCII letters, digits, '_' or '-'."
+        }
+        Locale::ZhHans => {
+            "优先从 Codex profile 配置解析 model_provider 和 sqlite_home。profile 名称可包含 ASCII 字母、数字、'_' 或 '-'。"
+        }
     }
 }
 
@@ -632,9 +636,12 @@ pub(crate) fn install_next_steps(
     locale: Locale,
     exe_path: &Path,
     codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
     manager: ServiceManager,
 ) -> Result<Vec<String>> {
-    let status_command = cli_status_command(exe_path, codex_home);
+    let status_command =
+        cli_status_command(exe_path, codex_home, provider_override, profile_override);
     let log_path = service::log_path()?;
     let mut steps = vec![run_status_next_step(locale, &status_command)];
     if let Some(command) = service::current_service_inspect_command()? {
@@ -647,12 +654,27 @@ pub(crate) fn install_next_steps(
     Ok(steps)
 }
 
-pub(crate) fn cli_status_command(exe_path: impl AsRef<Path>, codex_home: &Path) -> String {
-    format!(
-        "{} --codex-home {} status",
+pub(crate) fn cli_status_command(
+    exe_path: impl AsRef<Path>,
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
+) -> String {
+    let mut parts = vec![
         shell_quote(exe_path.as_ref().display().to_string()),
-        shell_quote(codex_home.display().to_string())
-    )
+        "--codex-home".to_string(),
+        shell_quote(codex_home.display().to_string()),
+    ];
+    if let Some(provider) = provider_override {
+        parts.push("--provider".to_string());
+        parts.push(shell_quote(provider.to_string()));
+    }
+    if let Some(profile) = profile_override {
+        parts.push("--profile".to_string());
+        parts.push(shell_quote(profile.to_string()));
+    }
+    parts.push("status".to_string());
+    parts.join(" ")
 }
 
 pub(crate) fn shell_quote(input: String) -> String {

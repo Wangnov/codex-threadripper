@@ -73,36 +73,51 @@ fn read_effective_codex_config(
     profile_override: Option<&str>,
 ) -> Result<ConfigToml> {
     let mut config = read_codex_config(codex_home)?;
-    let active_profile = profile_override
-        .and_then(trimmed_string)
-        .or_else(|| config.profile.as_deref().and_then(trimmed_string));
+    let explicit_profile = profile_override.and_then(trimmed_string);
+    let config_profile = config.profile.as_deref().and_then(trimmed_string);
 
-    if let Some(profile) = active_profile {
-        if !is_valid_profile_name(profile.as_str()) {
-            anyhow::bail!("profile `{profile}` is not a valid Codex profile name");
-        }
-        if let Some(profile_config) = read_profile_v2_config(codex_home, profile.as_str())? {
-            config.overlay(profile_config);
-        } else if let Some(profile_config) = config
-            .profiles
-            .as_ref()
-            .and_then(|profiles| profiles.get(profile.as_str()))
-        {
-            if let Some(provider) = profile_config.model_provider.as_ref() {
-                config.model_provider = Some(provider.clone());
-            }
-        } else {
-            anyhow::bail!(
-                "profile `{}` was not found; expected {} or [profiles.{}] in {}",
-                profile,
-                profile_config_path(codex_home, profile.as_str()).display(),
-                profile,
-                codex_home.join("config.toml").display()
-            );
-        }
+    if let Some(profile) = explicit_profile {
+        apply_profile_config(codex_home, &mut config, profile.as_str(), true)?;
+    } else if let Some(profile) = config_profile {
+        apply_profile_config(codex_home, &mut config, profile.as_str(), false)?;
     }
 
     Ok(config)
+}
+
+fn apply_profile_config(
+    codex_home: &Path,
+    config: &mut ConfigToml,
+    profile: &str,
+    required: bool,
+) -> Result<()> {
+    if !is_valid_profile_name(profile) {
+        anyhow::bail!("profile `{profile}` is not a valid Codex profile name");
+    }
+    if let Some(profile_config) = read_profile_v2_config(codex_home, profile)? {
+        config.overlay(profile_config);
+        return Ok(());
+    }
+    if let Some(profile_config) = config
+        .profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(profile))
+    {
+        if let Some(provider) = profile_config.model_provider.as_ref() {
+            config.model_provider = Some(provider.clone());
+        }
+        return Ok(());
+    }
+    if required {
+        anyhow::bail!(
+            "profile `{}` was not found; expected {} or [profiles.{}] in {}",
+            profile,
+            profile_config_path(codex_home, profile).display(),
+            profile,
+            codex_home.join("config.toml").display()
+        );
+    }
+    Ok(())
 }
 
 fn read_codex_config(codex_home: &Path) -> Result<ConfigToml> {
@@ -116,14 +131,30 @@ fn read_profile_v2_config(codex_home: &Path, profile: &str) -> Result<Option<Con
 }
 
 fn read_optional_config_file(path: &Path) -> Result<Option<ConfigToml>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
     toml::from_str(&raw)
         .map(Some)
         .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+pub(crate) fn selected_profile_config_path(
+    codex_home: &Path,
+    profile_override: Option<&str>,
+) -> Option<PathBuf> {
+    let profile = profile_override.and_then(trimmed_string).or_else(|| {
+        read_codex_config(codex_home)
+            .ok()
+            .and_then(|config| config.profile.as_deref().and_then(trimmed_string))
+    })?;
+    if is_valid_profile_name(profile.as_str()) {
+        Some(profile_config_path(codex_home, profile.as_str()))
+    } else {
+        None
+    }
 }
 
 fn profile_config_path(codex_home: &Path, profile: &str) -> PathBuf {

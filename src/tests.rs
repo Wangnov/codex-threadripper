@@ -21,6 +21,8 @@ use crate::state_db::inspect_sqlite_distribution;
 use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::reconcile_sqlite_with_backup;
 use crate::sync::reconcile_once;
+use crate::watch::full_watch_rollout_scope;
+use crate::watch::watched_config_paths;
 use anyhow::Result;
 use clap::FromArgMatches;
 use clap::error::ErrorKind;
@@ -163,6 +165,22 @@ fn errors_when_profile_config_is_missing() -> Result<()> {
     let err = read_provider_from_config(dir.path(), Some("missing")).unwrap_err();
 
     assert!(err.to_string().contains("profile `missing` was not found"));
+    Ok(())
+}
+
+#[test]
+fn falls_back_to_root_config_when_selected_profile_is_missing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("config.toml"),
+        "model_provider = \"openai\"\nsqlite_home = \"root-state\"\nprofile = \"missing\"\n",
+    )?;
+
+    let provider = read_provider_from_config(dir.path(), None)?;
+    let sqlite_path = resolve_sqlite_path(dir.path(), None)?;
+
+    assert_eq!(provider, "openai");
+    assert_eq!(sqlite_path, dir.path().join("root-state/state_5.sqlite"));
     Ok(())
 }
 
@@ -499,6 +517,35 @@ fn watch_uses_five_hundred_ms_by_default() -> Result<()> {
 }
 
 #[test]
+fn watch_promotes_initial_rollout_scan_to_all_rows() {
+    assert_eq!(
+        full_watch_rollout_scope(RolloutScope::MismatchedRows),
+        RolloutScope::AllRows
+    );
+    assert_eq!(
+        full_watch_rollout_scope(RolloutScope::None),
+        RolloutScope::None
+    );
+}
+
+#[test]
+fn watch_tracks_selected_profile_config_file() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    fs::write(
+        dir.path().join("config.toml"),
+        "model_provider = \"openai\"\nprofile = \"work\"\n",
+    )?;
+
+    let implicit = watched_config_paths(dir.path(), None);
+    let explicit = watched_config_paths(dir.path(), Some("other"));
+
+    assert!(implicit.contains(&dir.path().join("config.toml")));
+    assert!(implicit.contains(&dir.path().join("work.config.toml")));
+    assert!(explicit.contains(&dir.path().join("other.config.toml")));
+    Ok(())
+}
+
+#[test]
 fn generates_launchd_plist() {
     let plist = crate::service::build_launchd_plist(
         PathBuf::from("/tmp/codex-threadripper").as_path(),
@@ -520,11 +567,17 @@ fn builds_install_next_steps() -> Result<()> {
         Locale::ZhHans,
         PathBuf::from("/tmp/codex threadripper").as_path(),
         PathBuf::from("/tmp/codex home").as_path(),
+        Some("openai"),
+        Some("work"),
         ServiceManager::Launchd,
     )?;
     assert_eq!(steps.len(), 3);
     assert!(steps[0].contains("运行这条命令查看状态"));
-    assert!(steps[0].contains("'/tmp/codex threadripper' --codex-home '/tmp/codex home' status"));
+    assert!(
+        steps[0].contains(
+            "'/tmp/codex threadripper' --codex-home '/tmp/codex home' --provider openai --profile work status"
+        )
+    );
     assert!(steps[1].contains("launchctl print"));
     assert!(steps[2].contains("tail -f"));
     Ok(())
