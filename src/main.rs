@@ -172,7 +172,7 @@ enum BucketCommand {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct ConfigToml {
     model_provider: Option<String>,
     sqlite_home: Option<String>,
@@ -183,17 +183,6 @@ struct ConfigToml {
 #[derive(Debug, Deserialize)]
 struct ConfigProfileToml {
     model_provider: Option<String>,
-}
-
-impl Default for ConfigToml {
-    fn default() -> Self {
-        Self {
-            model_provider: None,
-            sqlite_home: None,
-            profile: None,
-            profiles: None,
-        }
-    }
 }
 
 impl ConfigToml {
@@ -279,6 +268,17 @@ struct RolloutProgress {
     printed: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RolloutProgressSnapshot {
+    visited_files: u64,
+    total_files: u64,
+    checked_files: u64,
+    changed_files: u64,
+    prepared_files: u64,
+    skipped_files: u64,
+    elapsed: Duration,
+}
+
 #[derive(Debug)]
 struct FirstLine {
     content: Vec<u8>,
@@ -322,16 +322,16 @@ impl RolloutProgress {
     }
 
     fn print(&mut self, summary: &RolloutReconcileSummary, final_line: bool) {
-        let message = rollout_progress_message(
-            self.config.locale,
-            self.visited_files,
-            self.total_files,
-            summary.checked_files,
-            summary.changed_files,
-            summary.prepared_files,
-            summary.skipped_files,
-            self.started_at.elapsed(),
-        );
+        let snapshot = RolloutProgressSnapshot {
+            visited_files: self.visited_files,
+            total_files: self.total_files,
+            checked_files: summary.checked_files,
+            changed_files: summary.changed_files,
+            prepared_files: summary.prepared_files,
+            skipped_files: summary.skipped_files,
+            elapsed: self.started_at.elapsed(),
+        };
+        let message = rollout_progress_message(self.config.locale, &snapshot);
         let mut stderr = std::io::stderr();
         if self.is_terminal {
             let _ = write!(stderr, "\r{message}\x1b[K");
@@ -794,6 +794,8 @@ fn run_watch(
     }
 
     let config_path = codex_home.join("config.toml");
+    let mut watched_paths = watched_config_paths(codex_home, profile_override.as_deref());
+    let full_rollout_scope = full_watch_rollout_scope(rollout_scope);
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_handler = Arc::clone(&shutdown);
     ctrlc::set_handler(move || {
@@ -819,7 +821,7 @@ fn run_watch(
         codex_home,
         provider_override.as_deref(),
         profile_override.as_deref(),
-        rollout_scope,
+        full_rollout_scope,
     ) {
         Ok(summary) => {
             print_sync_summary(locale, watch_started_title(locale), &summary);
@@ -840,12 +842,12 @@ fn run_watch(
         let timeout = next_poll_deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(timeout) {
             Ok(Ok(event)) => {
-                if touches_config_file(&event, &config_path) {
+                if touches_config_file(&event, watched_paths.as_slice()) {
                     match reconcile_once(
                         codex_home,
                         provider_override.as_deref(),
                         profile_override.as_deref(),
-                        rollout_scope,
+                        full_rollout_scope,
                     ) {
                         Ok(summary) => {
                             if last_provider.as_deref() != Some(summary.provider.as_str())
@@ -855,6 +857,8 @@ fn run_watch(
                                 print_sync_summary(locale, config_change_title(locale), &summary);
                             }
                             last_provider = Some(summary.provider.clone());
+                            watched_paths =
+                                watched_config_paths(codex_home, profile_override.as_deref());
                         }
                         Err(err) => {
                             eprintln!("{}", watch_reconcile_skipped_message(locale, &err));
@@ -901,11 +905,36 @@ fn run_watch(
     Ok(())
 }
 
-fn touches_config_file(event: &notify::Event, config_path: &Path) -> bool {
+fn full_watch_rollout_scope(rollout_scope: RolloutScope) -> RolloutScope {
+    match rollout_scope {
+        RolloutScope::None => RolloutScope::None,
+        RolloutScope::MismatchedRows | RolloutScope::AllRows => RolloutScope::AllRows,
+    }
+}
+
+fn watched_config_paths(codex_home: &Path, profile_override: Option<&str>) -> Vec<PathBuf> {
+    let mut paths = vec![codex_home.join("config.toml")];
+    let profile = profile_override.and_then(trimmed_string).or_else(|| {
+        read_codex_config(codex_home)
+            .ok()
+            .and_then(|config| config.profile.as_deref().and_then(trimmed_string))
+    });
+    if let Some(profile) = profile
+        && is_valid_profile_name(profile.as_str())
+    {
+        paths.push(profile_config_path(codex_home, profile.as_str()));
+    }
+    paths
+}
+
+fn touches_config_file(event: &notify::Event, config_paths: &[PathBuf]) -> bool {
     matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) && event.paths.iter().any(|path| path == config_path)
+    ) && event
+        .paths
+        .iter()
+        .any(|path| config_paths.iter().any(|config_path| path == config_path))
 }
 
 fn collect_status(
@@ -1082,36 +1111,51 @@ fn read_effective_codex_config(
     profile_override: Option<&str>,
 ) -> Result<ConfigToml> {
     let mut config = read_codex_config(codex_home)?;
-    let active_profile = profile_override
-        .and_then(trimmed_string)
-        .or_else(|| config.profile.as_deref().and_then(trimmed_string));
+    let explicit_profile = profile_override.and_then(trimmed_string);
+    let config_profile = config.profile.as_deref().and_then(trimmed_string);
 
-    if let Some(profile) = active_profile {
-        if !is_valid_profile_name(profile.as_str()) {
-            anyhow::bail!("profile `{profile}` is not a valid Codex profile name");
-        }
-        if let Some(profile_config) = read_profile_v2_config(codex_home, profile.as_str())? {
-            config.overlay(profile_config);
-        } else if let Some(profile_config) = config
-            .profiles
-            .as_ref()
-            .and_then(|profiles| profiles.get(profile.as_str()))
-        {
-            if let Some(provider) = profile_config.model_provider.as_ref() {
-                config.model_provider = Some(provider.clone());
-            }
-        } else {
-            anyhow::bail!(
-                "profile `{}` was not found; expected {} or [profiles.{}] in {}",
-                profile,
-                profile_config_path(codex_home, profile.as_str()).display(),
-                profile,
-                codex_home.join("config.toml").display()
-            );
-        }
+    if let Some(profile) = explicit_profile {
+        apply_profile_config(codex_home, &mut config, profile.as_str(), true)?;
+    } else if let Some(profile) = config_profile {
+        apply_profile_config(codex_home, &mut config, profile.as_str(), false)?;
     }
 
     Ok(config)
+}
+
+fn apply_profile_config(
+    codex_home: &Path,
+    config: &mut ConfigToml,
+    profile: &str,
+    required: bool,
+) -> Result<()> {
+    if !is_valid_profile_name(profile) {
+        anyhow::bail!("profile `{profile}` is not a valid Codex profile name");
+    }
+    if let Some(profile_config) = read_profile_v2_config(codex_home, profile)? {
+        config.overlay(profile_config);
+        return Ok(());
+    }
+    if let Some(profile_config) = config
+        .profiles
+        .as_ref()
+        .and_then(|profiles| profiles.get(profile))
+    {
+        if let Some(provider) = profile_config.model_provider.as_ref() {
+            config.model_provider = Some(provider.clone());
+        }
+        return Ok(());
+    }
+    if required {
+        anyhow::bail!(
+            "profile `{}` was not found; expected {} or [profiles.{}] in {}",
+            profile,
+            profile_config_path(codex_home, profile).display(),
+            profile,
+            codex_home.join("config.toml").display()
+        );
+    }
+    Ok(())
 }
 
 fn read_codex_config(codex_home: &Path) -> Result<ConfigToml> {
@@ -1125,11 +1169,11 @@ fn read_profile_v2_config(codex_home: &Path, profile: &str) -> Result<Option<Con
 }
 
 fn read_optional_config_file(path: &Path) -> Result<Option<ConfigToml>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
     toml::from_str(&raw)
         .map(Some)
         .with_context(|| format!("failed to parse {}", path.display()))
@@ -1864,7 +1908,14 @@ fn install_service(
     print_install_service_summary(locale, codex_home, poll_interval, &summary);
     println!();
     println!("{}", next_steps_heading(locale));
-    for line in install_next_steps(locale, exe_path.as_path(), codex_home, summary.manager)? {
+    for line in install_next_steps(
+        locale,
+        exe_path.as_path(),
+        codex_home,
+        provider_override,
+        profile_override,
+        summary.manager,
+    )? {
         println!("{line}");
     }
     Ok(())
@@ -1882,7 +1933,7 @@ fn uninstall_service(locale: Locale, codex_home: &Path) -> Result<()> {
             "{}",
             run_status_next_step(
                 locale,
-                &cli_status_command(std::env::current_exe()?, codex_home)
+                &cli_status_command(std::env::current_exe()?, codex_home, None, None)
             )
         );
     } else {
@@ -1956,16 +2007,16 @@ fn print_status(locale: Locale, summary: &StatusSummary) {
     );
 }
 
-fn rollout_progress_message(
-    locale: Locale,
-    visited_files: u64,
-    total_files: u64,
-    checked_files: u64,
-    changed_files: u64,
-    prepared_files: u64,
-    skipped_files: u64,
-    elapsed: Duration,
-) -> String {
+fn rollout_progress_message(locale: Locale, snapshot: &RolloutProgressSnapshot) -> String {
+    let RolloutProgressSnapshot {
+        visited_files,
+        total_files,
+        checked_files,
+        changed_files,
+        prepared_files,
+        skipped_files,
+        elapsed,
+    } = *snapshot;
     match locale {
         Locale::En => format!(
             "Rollouts: scanned {visited_files}/{total_files}, checked {checked_files}, updated {changed_files}, prepared {prepared_files}, skipped {skipped_files}, elapsed {} ms",
@@ -2090,10 +2141,10 @@ fn root_about(locale: Locale) -> &'static str {
 fn root_long_about(locale: Locale) -> &'static str {
     match locale {
         Locale::En => {
-            "codex-threadripper is a human-first maintenance tool for Codex thread history.\n\nIt reads the active provider from CODEX_HOME/config.toml and rewrites Codex's SQLite state DB so every thread stays in the same provider bucket. The DB defaults to CODEX_HOME/state_5.sqlite, but sqlite_home and CODEX_SQLITE_HOME are respected. That makes thread lists and resume flows stop fragmenting across providers.\n\nExamples:\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
+            "codex-threadripper is a human-first maintenance tool for Codex thread history.\n\nIt reads the effective Codex provider from CODEX_HOME/config.toml, including the selected profile config when present, and rewrites Codex's SQLite state DB so every thread stays in the same provider bucket. The DB defaults to CODEX_HOME/state_5.sqlite, but sqlite_home and CODEX_SQLITE_HOME are respected. That makes thread lists and resume flows stop fragmenting across providers.\n\nExamples:\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
         }
         Locale::ZhHans => {
-            "codex-threadripper 是一个面向人的 Codex 线程历史维护工具。\n\n它会读取 CODEX_HOME/config.toml 里的当前 provider，并改写 Codex 的 SQLite 状态库，让所有线程始终落在同一个 provider 桶里。状态库默认是 CODEX_HOME/state_5.sqlite，同时会尊重 sqlite_home 和 CODEX_SQLITE_HOME。这样线程列表和 resume 流程就不会再被 provider 切碎。\n\n示例：\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
+            "codex-threadripper 是一个面向人的 Codex 线程历史维护工具。\n\n它会读取 CODEX_HOME/config.toml 和已选 profile 配置合成后的有效 provider，并改写 Codex 的 SQLite 状态库，让所有线程始终落在同一个 provider 桶里。状态库默认是 CODEX_HOME/state_5.sqlite，同时会尊重 sqlite_home 和 CODEX_SQLITE_HOME。这样线程列表和 resume 流程就不会再被 provider 切碎。\n\n示例：\n  codex-threadripper status\n  codex-threadripper sync\n  codex-threadripper watch\n  codex-threadripper install-service"
         }
     }
 }
@@ -2170,8 +2221,12 @@ fn provider_help(locale: Locale) -> &'static str {
 
 fn profile_help(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Resolve model_provider and sqlite_home from a Codex profile config first.",
-        Locale::ZhHans => "优先从 Codex profile 配置解析 model_provider 和 sqlite_home。",
+        Locale::En => {
+            "Resolve model_provider and sqlite_home from a Codex profile config first. Profile names may contain ASCII letters, digits, '_' or '-'."
+        }
+        Locale::ZhHans => {
+            "优先从 Codex profile 配置解析 model_provider 和 sqlite_home。profile 名称可包含 ASCII 字母、数字、'_' 或 '-'。"
+        }
     }
 }
 
@@ -2498,9 +2553,12 @@ fn install_next_steps(
     locale: Locale,
     exe_path: &Path,
     codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
     manager: ServiceManager,
 ) -> Result<Vec<String>> {
-    let status_command = cli_status_command(exe_path, codex_home);
+    let status_command =
+        cli_status_command(exe_path, codex_home, provider_override, profile_override);
     let log_path = service::log_path()?;
     let mut steps = vec![run_status_next_step(locale, &status_command)];
     if let Some(command) = service::current_service_inspect_command()? {
@@ -2513,12 +2571,27 @@ fn install_next_steps(
     Ok(steps)
 }
 
-fn cli_status_command(exe_path: impl AsRef<Path>, codex_home: &Path) -> String {
-    format!(
-        "{} --codex-home {} status",
+fn cli_status_command(
+    exe_path: impl AsRef<Path>,
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
+) -> String {
+    let mut parts = vec![
         shell_quote(exe_path.as_ref().display().to_string()),
-        shell_quote(codex_home.display().to_string())
-    )
+        "--codex-home".to_string(),
+        shell_quote(codex_home.display().to_string()),
+    ];
+    if let Some(provider) = provider_override {
+        parts.push("--provider".to_string());
+        parts.push(shell_quote(provider.to_string()));
+    }
+    if let Some(profile) = profile_override {
+        parts.push("--profile".to_string());
+        parts.push(shell_quote(profile.to_string()));
+    }
+    parts.push("status".to_string());
+    parts.join(" ")
 }
 
 fn shell_quote(input: String) -> String {
@@ -2750,6 +2823,7 @@ mod tests {
     use super::Locale;
     use super::RolloutScope;
     use super::detect_locale_from_sources;
+    use super::full_watch_rollout_scope;
     use super::inspect_sqlite_distribution;
     use super::install_next_steps;
     use super::localized_command;
@@ -2764,6 +2838,7 @@ mod tests {
     use super::resolve_sqlite_path;
     use super::validate_provider_override;
     use super::validate_provider_override_args;
+    use super::watched_config_paths;
     use crate::service::ServiceManager;
     use anyhow::Result;
     use clap::FromArgMatches;
@@ -2908,6 +2983,22 @@ model_provider = "local"
         let err = read_provider_from_config(dir.path(), Some("missing")).unwrap_err();
 
         assert!(err.to_string().contains("profile `missing` was not found"));
+        Ok(())
+    }
+
+    #[test]
+    fn falls_back_to_root_config_when_selected_profile_is_missing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("config.toml"),
+            "model_provider = \"openai\"\nsqlite_home = \"root-state\"\nprofile = \"missing\"\n",
+        )?;
+
+        let provider = read_provider_from_config(dir.path(), None)?;
+        let sqlite_path = resolve_sqlite_path(dir.path(), None)?;
+
+        assert_eq!(provider, "openai");
+        assert_eq!(sqlite_path, dir.path().join("root-state/state_5.sqlite"));
         Ok(())
     }
 
@@ -3215,6 +3306,35 @@ model_provider = "local"
     }
 
     #[test]
+    fn watch_promotes_initial_rollout_scan_to_all_rows() {
+        assert_eq!(
+            full_watch_rollout_scope(RolloutScope::MismatchedRows),
+            RolloutScope::AllRows
+        );
+        assert_eq!(
+            full_watch_rollout_scope(RolloutScope::None),
+            RolloutScope::None
+        );
+    }
+
+    #[test]
+    fn watch_tracks_selected_profile_config_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("config.toml"),
+            "model_provider = \"openai\"\nprofile = \"work\"\n",
+        )?;
+
+        let implicit = watched_config_paths(dir.path(), None);
+        let explicit = watched_config_paths(dir.path(), Some("other"));
+
+        assert!(implicit.contains(&dir.path().join("config.toml")));
+        assert!(implicit.contains(&dir.path().join("work.config.toml")));
+        assert!(explicit.contains(&dir.path().join("other.config.toml")));
+        Ok(())
+    }
+
+    #[test]
     fn generates_launchd_plist() {
         let plist = crate::service::build_launchd_plist(
             PathBuf::from("/tmp/codex-threadripper").as_path(),
@@ -3236,12 +3356,16 @@ model_provider = "local"
             Locale::ZhHans,
             PathBuf::from("/tmp/codex threadripper").as_path(),
             PathBuf::from("/tmp/codex home").as_path(),
+            Some("openai"),
+            Some("work"),
             ServiceManager::Launchd,
         )?;
         assert_eq!(steps.len(), 3);
         assert!(steps[0].contains("运行这条命令查看状态"));
         assert!(
-            steps[0].contains("'/tmp/codex threadripper' --codex-home '/tmp/codex home' status")
+            steps[0].contains(
+                "'/tmp/codex threadripper' --codex-home '/tmp/codex home' --provider openai --profile work status"
+            )
         );
         assert!(steps[1].contains("launchctl print"));
         assert!(steps[2].contains("tail -f"));

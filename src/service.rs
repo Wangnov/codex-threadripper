@@ -1162,6 +1162,7 @@ enum ProcessStatus {
 
 #[cfg(test)]
 mod tests {
+    use super::build_linux_runner_script;
     use super::build_windows_startup_vbs;
     use super::installed_windows_startup_config_path;
     use anyhow::Result;
@@ -1228,6 +1229,36 @@ mod tests {
                 r#"--provider "open ai \"beta\"" watch --poll-interval-ms 500"#
             )
         );
+    }
+
+    #[test]
+    fn linux_runner_script_preserves_profile_override() {
+        let script = build_linux_runner_script(
+            Path::new("/opt/codex threadripper/bin/codex-threadripper"),
+            Path::new("/home/user/.codex"),
+            None,
+            Some("work"),
+            Duration::from_millis(500),
+        );
+
+        assert!(script.contains("'/opt/codex threadripper/bin/codex-threadripper'"));
+        assert!(script.contains("--profile work"));
+        assert!(script.contains("watch --poll-interval-ms 500"));
+    }
+
+    #[test]
+    fn windows_startup_vbs_preserves_profile_override() {
+        let script = build_windows_startup_vbs(
+            Path::new(r"C:\Tools\codex-threadripper.exe"),
+            Path::new(r"C:\Codex"),
+            None,
+            Some("work"),
+            Duration::from_millis(500),
+        );
+        let command = shell_run_command(&script);
+
+        assert!(command.contains("--profile work"));
+        assert!(command.ends_with("watch --poll-interval-ms 500"));
     }
 
     fn shell_run_command(script: &str) -> String {
