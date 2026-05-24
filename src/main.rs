@@ -3193,6 +3193,37 @@ model_provider = "local"
     }
 
     #[test]
+    fn seed_sqlite_fixture_includes_current_codex_thread_columns() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sqlite_path = dir.path().join("state_5.sqlite");
+        seed_sqlite(&sqlite_path)?;
+        let connection = Connection::open(&sqlite_path)?;
+
+        let mut statement = connection.prepare("PRAGMA table_info(threads)")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for column in ["created_at_ms", "updated_at_ms", "thread_source", "preview"] {
+            assert!(columns.iter().any(|candidate| candidate == column));
+        }
+
+        let (created_at_ms, updated_at_ms, thread_source, preview): (
+            i64,
+            i64,
+            String,
+            String,
+        ) = connection.query_row(
+            "SELECT created_at_ms, updated_at_ms, thread_source, preview FROM threads WHERE id = '1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!((created_at_ms, updated_at_ms), (1000, 1000));
+        assert_eq!(thread_source, "user");
+        assert_eq!(preview, "a");
+        Ok(())
+    }
+
+    #[test]
     fn durable_sync_updates_matching_rollout_session_meta() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let codex_home = dir.path();
@@ -3416,7 +3447,10 @@ model_provider = "local"
                 rollout_path TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
+                created_at_ms INTEGER,
+                updated_at_ms INTEGER,
                 source TEXT NOT NULL,
+                thread_source TEXT,
                 model_provider TEXT NOT NULL,
                 cwd TEXT NOT NULL,
                 title TEXT NOT NULL,
@@ -3436,15 +3470,65 @@ model_provider = "local"
                 memory_mode TEXT NOT NULL DEFAULT 'enabled',
                 model TEXT,
                 reasoning_effort TEXT,
-                agent_path TEXT
+                agent_path TEXT,
+                preview TEXT NOT NULL DEFAULT ''
             );
+            CREATE INDEX idx_threads_created_at ON threads(created_at DESC, id DESC);
+            CREATE INDEX idx_threads_updated_at ON threads(updated_at DESC, id DESC);
+            CREATE INDEX idx_threads_archived ON threads(archived);
+            CREATE INDEX idx_threads_source ON threads(source);
+            CREATE INDEX idx_threads_provider ON threads(model_provider);
+            CREATE INDEX idx_threads_created_at_ms ON threads(created_at_ms DESC, id DESC);
+            CREATE INDEX idx_threads_updated_at_ms ON threads(updated_at_ms DESC, id DESC);
+            CREATE INDEX idx_threads_archived_cwd_created_at_ms
+                ON threads(archived, cwd, created_at_ms DESC, id DESC);
+            CREATE INDEX idx_threads_archived_cwd_updated_at_ms
+                ON threads(archived, cwd, updated_at_ms DESC, id DESC);
+            CREATE TRIGGER threads_created_at_ms_after_insert
+            AFTER INSERT ON threads
+            WHEN NEW.created_at_ms IS NULL
+            BEGIN
+                UPDATE threads
+                SET created_at_ms = NEW.created_at * 1000
+                WHERE id = NEW.id;
+            END;
+            CREATE TRIGGER threads_updated_at_ms_after_insert
+            AFTER INSERT ON threads
+            WHEN NEW.updated_at_ms IS NULL
+            BEGIN
+                UPDATE threads
+                SET updated_at_ms = NEW.updated_at * 1000
+                WHERE id = NEW.id;
+            END;
+            CREATE TRIGGER threads_created_at_ms_after_update
+            AFTER UPDATE OF created_at ON threads
+            WHEN NEW.created_at != OLD.created_at
+             AND NEW.created_at_ms IS OLD.created_at_ms
+            BEGIN
+                UPDATE threads
+                SET created_at_ms = NEW.created_at * 1000
+                WHERE id = NEW.id;
+            END;
+            CREATE TRIGGER threads_updated_at_ms_after_update
+            AFTER UPDATE OF updated_at ON threads
+            WHEN NEW.updated_at != OLD.updated_at
+             AND NEW.updated_at_ms IS OLD.updated_at_ms
+            BEGIN
+                UPDATE threads
+                SET updated_at_ms = NEW.updated_at * 1000
+                WHERE id = NEW.id;
+            END;
             INSERT INTO threads (
-                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
-                sandbox_policy, approval_mode
+                id, rollout_path, created_at, updated_at, created_at_ms, updated_at_ms,
+                source, thread_source, model_provider, cwd, title, sandbox_policy,
+                approval_mode, cli_version, model, reasoning_effort, first_user_message, preview
             ) VALUES
-                ('1', '/tmp/a', 1, 1, 'cli', 'vm', '/tmp', 'a', 'workspace-write', 'auto'),
-                ('2', '/tmp/b', 1, 1, 'cli', 'cp', '/tmp', 'b', 'workspace-write', 'auto'),
-                ('3', '/tmp/c', 1, 1, 'cli', 'openai', '/tmp', 'c', 'workspace-write', 'auto');
+                ('1', '/tmp/a', 1, 1, 1000, 1000, 'cli', 'user', 'vm', '/tmp', 'a',
+                    'workspace-write', 'auto', '0.0.0-test', 'gpt-5-codex', 'medium', 'a', 'a'),
+                ('2', '/tmp/b', 1, 1, 1001, 1001, 'cli', 'user', 'cp', '/tmp', 'b',
+                    'workspace-write', 'auto', '0.0.0-test', 'gpt-5-codex', 'medium', 'b', 'b'),
+                ('3', '/tmp/c', 1, 1, 1002, 1002, 'cli', 'user', 'openai', '/tmp', 'c',
+                    'workspace-write', 'auto', '0.0.0-test', 'gpt-5-codex', 'medium', 'c', 'c');
             ",
         )?;
         Ok(())

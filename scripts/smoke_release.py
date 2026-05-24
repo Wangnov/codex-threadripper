@@ -19,7 +19,10 @@ CREATE TABLE threads (
     rollout_path TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
+    created_at_ms INTEGER,
+    updated_at_ms INTEGER,
     source TEXT NOT NULL,
+    thread_source TEXT,
     model_provider TEXT NOT NULL,
     cwd TEXT NOT NULL,
     title TEXT NOT NULL,
@@ -39,8 +42,54 @@ CREATE TABLE threads (
     memory_mode TEXT NOT NULL DEFAULT 'enabled',
     model TEXT,
     reasoning_effort TEXT,
-    agent_path TEXT
+    agent_path TEXT,
+    preview TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX idx_threads_created_at ON threads(created_at DESC, id DESC);
+CREATE INDEX idx_threads_updated_at ON threads(updated_at DESC, id DESC);
+CREATE INDEX idx_threads_archived ON threads(archived);
+CREATE INDEX idx_threads_source ON threads(source);
+CREATE INDEX idx_threads_provider ON threads(model_provider);
+CREATE INDEX idx_threads_created_at_ms ON threads(created_at_ms DESC, id DESC);
+CREATE INDEX idx_threads_updated_at_ms ON threads(updated_at_ms DESC, id DESC);
+CREATE INDEX idx_threads_archived_cwd_created_at_ms
+    ON threads(archived, cwd, created_at_ms DESC, id DESC);
+CREATE INDEX idx_threads_archived_cwd_updated_at_ms
+    ON threads(archived, cwd, updated_at_ms DESC, id DESC);
+CREATE TRIGGER threads_created_at_ms_after_insert
+AFTER INSERT ON threads
+WHEN NEW.created_at_ms IS NULL
+BEGIN
+    UPDATE threads
+    SET created_at_ms = NEW.created_at * 1000
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER threads_updated_at_ms_after_insert
+AFTER INSERT ON threads
+WHEN NEW.updated_at_ms IS NULL
+BEGIN
+    UPDATE threads
+    SET updated_at_ms = NEW.updated_at * 1000
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER threads_created_at_ms_after_update
+AFTER UPDATE OF created_at ON threads
+WHEN NEW.created_at != OLD.created_at
+ AND NEW.created_at_ms IS OLD.created_at_ms
+BEGIN
+    UPDATE threads
+    SET created_at_ms = NEW.created_at * 1000
+    WHERE id = NEW.id;
+END;
+CREATE TRIGGER threads_updated_at_ms_after_update
+AFTER UPDATE OF updated_at ON threads
+WHEN NEW.updated_at != OLD.updated_at
+ AND NEW.updated_at_ms IS OLD.updated_at_ms
+BEGIN
+    UPDATE threads
+    SET updated_at_ms = NEW.updated_at * 1000
+    WHERE id = NEW.id;
+END;
 """
 
 COMMAND_TIMEOUT_SECONDS = 30
@@ -141,14 +190,72 @@ def prepare_codex_home(codex_home: pathlib.Path) -> None:
     connection.executemany(
         """
         INSERT INTO threads (
-            id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
-            sandbox_policy, approval_mode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            id, rollout_path, created_at, updated_at, created_at_ms, updated_at_ms,
+            source, thread_source, model_provider, cwd, title, sandbox_policy, approval_mode,
+            cli_version, model, reasoning_effort, first_user_message, preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
-            ("1", "/tmp/a", 1, 1, "cli", "vm", "/tmp", "a", "workspace-write", "auto"),
-            ("2", "/tmp/b", 1, 1, "cli", "cp", "/tmp", "b", "workspace-write", "auto"),
-            ("3", "/tmp/c", 1, 1, "cli", "openai", "/tmp", "c", "workspace-write", "auto"),
+            (
+                "1",
+                "/tmp/a",
+                1,
+                1,
+                1000,
+                1000,
+                "cli",
+                "user",
+                "vm",
+                "/tmp",
+                "a",
+                "workspace-write",
+                "auto",
+                "0.0.0-test",
+                "gpt-5-codex",
+                "medium",
+                "a",
+                "a",
+            ),
+            (
+                "2",
+                "/tmp/b",
+                1,
+                1,
+                1001,
+                1001,
+                "cli",
+                "user",
+                "cp",
+                "/tmp",
+                "b",
+                "workspace-write",
+                "auto",
+                "0.0.0-test",
+                "gpt-5-codex",
+                "medium",
+                "b",
+                "b",
+            ),
+            (
+                "3",
+                "/tmp/c",
+                1,
+                1,
+                1002,
+                1002,
+                "cli",
+                "user",
+                "openai",
+                "/tmp",
+                "c",
+                "workspace-write",
+                "auto",
+                "0.0.0-test",
+                "gpt-5-codex",
+                "medium",
+                "c",
+                "c",
+            ),
         ],
     )
     connection.commit()
@@ -274,11 +381,31 @@ def insert_dirty_row(sqlite_path: pathlib.Path) -> None:
     connection.execute(
         """
         INSERT INTO threads (
-            id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
-            sandbox_policy, approval_mode
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            id, rollout_path, created_at, updated_at, created_at_ms, updated_at_ms,
+            source, thread_source, model_provider, cwd, title, sandbox_policy, approval_mode,
+            cli_version, model, reasoning_effort, first_user_message, preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        ("4", "/tmp/d", 1, 1, "cli", "vm", "/tmp", "d", "workspace-write", "auto"),
+        (
+            "4",
+            "/tmp/d",
+            1,
+            1,
+            1003,
+            1003,
+            "cli",
+            "user",
+            "vm",
+            "/tmp",
+            "d",
+            "workspace-write",
+            "auto",
+            "0.0.0-test",
+            "gpt-5-codex",
+            "medium",
+            "d",
+            "d",
+        ),
     )
     connection.commit()
     connection.close()
