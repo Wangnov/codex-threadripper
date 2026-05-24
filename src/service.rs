@@ -74,21 +74,34 @@ pub fn install_service(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<ServiceInstallSummary> {
     let manager = current_manager();
     stop_detached_watch_if_present(codex_home)?;
 
     match manager {
-        ServiceManager::Launchd => {
-            install_launchd(exe_path, codex_home, provider_override, poll_interval)
-        }
-        ServiceManager::SystemdUser => {
-            install_systemd_user(exe_path, codex_home, provider_override, poll_interval)
-        }
-        ServiceManager::WindowsStartup => {
-            install_windows_startup(exe_path, codex_home, provider_override, poll_interval)
-        }
+        ServiceManager::Launchd => install_launchd(
+            exe_path,
+            codex_home,
+            provider_override,
+            profile_override,
+            poll_interval,
+        ),
+        ServiceManager::SystemdUser => install_systemd_user(
+            exe_path,
+            codex_home,
+            provider_override,
+            profile_override,
+            poll_interval,
+        ),
+        ServiceManager::WindowsStartup => install_windows_startup(
+            exe_path,
+            codex_home,
+            provider_override,
+            profile_override,
+            poll_interval,
+        ),
     }
 }
 
@@ -110,6 +123,7 @@ pub fn render_service_config(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<String> {
     let manager = current_manager();
@@ -118,15 +132,21 @@ pub fn render_service_config(
             exe_path,
             codex_home,
             provider_override,
+            profile_override,
             poll_interval,
         )),
-        ServiceManager::SystemdUser => {
-            build_systemd_bundle(exe_path, codex_home, provider_override, poll_interval)
-        }
+        ServiceManager::SystemdUser => build_systemd_bundle(
+            exe_path,
+            codex_home,
+            provider_override,
+            profile_override,
+            poll_interval,
+        ),
         ServiceManager::WindowsStartup => Ok(build_windows_startup_vbs(
             exe_path,
             codex_home,
             provider_override,
+            profile_override,
             poll_interval,
         )),
     }
@@ -171,6 +191,7 @@ fn install_launchd(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<ServiceInstallSummary> {
     let plist_path = service_config_path(ServiceManager::Launchd)?;
@@ -179,7 +200,13 @@ fn install_launchd(
         .with_context(|| format!("launchd plist path has no parent: {}", plist_path.display()))?;
     std::fs::create_dir_all(launch_agents_dir)?;
 
-    let plist = build_launchd_plist(exe_path, codex_home, provider_override, poll_interval);
+    let plist = build_launchd_plist(
+        exe_path,
+        codex_home,
+        provider_override,
+        profile_override,
+        poll_interval,
+    );
     std::fs::write(&plist_path, plist)
         .with_context(|| format!("failed to write {}", plist_path.display()))?;
 
@@ -221,6 +248,7 @@ fn install_systemd_user(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<ServiceInstallSummary> {
     let config_path = service_config_path(ServiceManager::SystemdUser)?;
@@ -238,7 +266,13 @@ fn install_systemd_user(
     })?;
     std::fs::create_dir_all(runner_script_dir)?;
 
-    let script = build_linux_runner_script(exe_path, codex_home, provider_override, poll_interval);
+    let script = build_linux_runner_script(
+        exe_path,
+        codex_home,
+        provider_override,
+        profile_override,
+        poll_interval,
+    );
     std::fs::write(&runner_script_path, script)
         .with_context(|| format!("failed to write {}", runner_script_path.display()))?;
     make_executable(&runner_script_path)?;
@@ -249,7 +283,13 @@ fn install_systemd_user(
 
     let systemd_started = try_run_systemd_user_unit()?;
     if !systemd_started {
-        start_detached_watch(exe_path, codex_home, provider_override, poll_interval)?;
+        start_detached_watch(
+            exe_path,
+            codex_home,
+            provider_override,
+            profile_override,
+            poll_interval,
+        )?;
     }
 
     Ok(ServiceInstallSummary {
@@ -286,6 +326,7 @@ fn install_windows_startup(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<ServiceInstallSummary> {
     let config_path = service_config_path(ServiceManager::WindowsStartup)?;
@@ -297,7 +338,13 @@ fn install_windows_startup(
     })?;
     std::fs::create_dir_all(config_dir)?;
 
-    let script = build_windows_startup_vbs(exe_path, codex_home, provider_override, poll_interval);
+    let script = build_windows_startup_vbs(
+        exe_path,
+        codex_home,
+        provider_override,
+        profile_override,
+        poll_interval,
+    );
     std::fs::write(&config_path, script)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
 
@@ -307,7 +354,13 @@ fn install_windows_startup(
             .with_context(|| format!("failed to remove {}", legacy_cmd_path.display()))?;
     }
 
-    start_detached_watch(exe_path, codex_home, provider_override, poll_interval)?;
+    start_detached_watch(
+        exe_path,
+        codex_home,
+        provider_override,
+        profile_override,
+        poll_interval,
+    )?;
 
     Ok(ServiceInstallSummary {
         manager: ServiceManager::WindowsStartup,
@@ -393,10 +446,17 @@ fn build_systemd_bundle(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<String> {
     let runner_script_path = linux_runner_script_path()?;
-    let script = build_linux_runner_script(exe_path, codex_home, provider_override, poll_interval);
+    let script = build_linux_runner_script(
+        exe_path,
+        codex_home,
+        provider_override,
+        profile_override,
+        poll_interval,
+    );
     let unit = build_systemd_unit(&runner_script_path);
     Ok(format!(
         "# {}\n{}\n# {}\n{}",
@@ -418,6 +478,7 @@ fn build_linux_runner_script(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> String {
     format!(
@@ -426,6 +487,7 @@ fn build_linux_runner_script(
             exe_path,
             codex_home,
             provider_override,
+            profile_override,
             poll_interval,
             ShellFlavor::Sh
         )
@@ -436,12 +498,14 @@ fn build_windows_startup_vbs(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> String {
     let command = watch_command_line(
         exe_path,
         codex_home,
         provider_override,
+        profile_override,
         poll_interval,
         ShellFlavor::WindowsProcess,
     );
@@ -456,6 +520,7 @@ pub fn build_launchd_plist(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> String {
     let stdout_path =
@@ -471,6 +536,10 @@ pub fn build_launchd_plist(
     if let Some(provider) = provider_override {
         arguments.push("--provider".to_string());
         arguments.push(xml_escape(provider));
+    }
+    if let Some(profile) = profile_override {
+        arguments.push("--profile".to_string());
+        arguments.push(xml_escape(profile));
     }
     arguments.push("watch".to_string());
     arguments.push("--poll-interval-ms".to_string());
@@ -516,6 +585,7 @@ fn watch_command_line(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
     flavor: ShellFlavor,
 ) -> String {
@@ -533,6 +603,10 @@ fn watch_command_line(
         parts.push("--provider".to_string());
         parts.push(quote(provider.to_string()));
     }
+    if let Some(profile) = profile_override {
+        parts.push("--profile".to_string());
+        parts.push(quote(profile.to_string()));
+    }
     parts.push("watch".to_string());
     parts.push("--poll-interval-ms".to_string());
     parts.push(poll_interval.as_millis().to_string());
@@ -549,6 +623,7 @@ fn start_detached_watch(
     exe_path: &Path,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<()> {
     let stdout_path = log_path_for(codex_home)?;
@@ -573,6 +648,9 @@ fn start_detached_watch(
 
     if let Some(provider) = provider_override {
         command.arg("--provider").arg(provider);
+    }
+    if let Some(profile) = profile_override {
+        command.arg("--profile").arg(profile);
     }
 
     command
@@ -1112,6 +1190,7 @@ mod tests {
             Path::new(r"C:\Program Files\codex threadripper\codex-threadripper.exe"),
             Path::new(r"C:\Users\Admin User\.codex"),
             None,
+            None,
             Duration::from_millis(1500),
         );
         let command = shell_run_command(&script);
@@ -1136,6 +1215,7 @@ mod tests {
             Path::new(r"C:\Tools\codex-threadripper.exe"),
             Path::new(r"C:\Codex"),
             Some(r#"open ai "beta""#),
+            None,
             Duration::from_millis(500),
         );
         let command = shell_run_command(&script);

@@ -21,6 +21,7 @@ use rusqlite::backup::StepResult;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
@@ -48,6 +49,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_PROVIDER: &str = "openai";
 const CODEX_SQLITE_HOME_ENV: &str = "CODEX_SQLITE_HOME";
 const STATE_DB_FILENAME: &str = "state_5.sqlite";
+const PROFILE_CONFIG_SUFFIX: &str = ".config.toml";
 const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
 const DEFAULT_BUCKET_PADDING_BYTES: usize = 256;
 const ROLLOUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
@@ -82,6 +84,9 @@ struct Cli {
 
     #[arg(long, global = true, value_name = "PROVIDER", help = "placeholder")]
     provider: Option<String>,
+
+    #[arg(long, global = true, value_name = "PROFILE", help = "placeholder")]
+    profile: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -171,6 +176,35 @@ enum BucketCommand {
 struct ConfigToml {
     model_provider: Option<String>,
     sqlite_home: Option<String>,
+    profile: Option<String>,
+    profiles: Option<BTreeMap<String, ConfigProfileToml>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigProfileToml {
+    model_provider: Option<String>,
+}
+
+impl Default for ConfigToml {
+    fn default() -> Self {
+        Self {
+            model_provider: None,
+            sqlite_home: None,
+            profile: None,
+            profiles: None,
+        }
+    }
+}
+
+impl ConfigToml {
+    fn overlay(&mut self, profile_config: ConfigToml) {
+        if profile_config.model_provider.is_some() {
+            self.model_provider = profile_config.model_provider;
+        }
+        if profile_config.sqlite_home.is_some() {
+            self.sqlite_home = profile_config.sqlite_home;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -334,11 +368,13 @@ fn main() -> Result<()> {
     let locale = detect_locale();
     let cli = parse_cli(locale)?;
     validate_provider_override(locale, cli.provider.as_deref())?;
+    validate_profile_override(locale, cli.profile.as_deref())?;
     let codex_home = cli.codex_home.unwrap_or_else(default_codex_home);
 
     match cli.command {
         Command::Status => {
-            let summary = collect_status(&codex_home, cli.provider.as_deref())?;
+            let summary =
+                collect_status(&codex_home, cli.provider.as_deref(), cli.profile.as_deref())?;
             print_status(locale, &summary);
         }
         Command::Sync { sqlite_only } => {
@@ -355,6 +391,7 @@ fn main() -> Result<()> {
             let summary = reconcile_once_with_backup_progress(
                 &codex_home,
                 cli.provider.as_deref(),
+                cli.profile.as_deref(),
                 rollout_scope,
                 progress,
             )?;
@@ -362,7 +399,8 @@ fn main() -> Result<()> {
         }
         Command::Bucket { command } => match command {
             BucketCommand::Prepare { padding_bytes } => {
-                let summary = prepare_bucket_padding(&codex_home, padding_bytes)?;
+                let summary =
+                    prepare_bucket_padding(&codex_home, cli.profile.as_deref(), padding_bytes)?;
                 print_bucket_prepare_summary(locale, &summary);
             }
             BucketCommand::Switch {
@@ -377,6 +415,7 @@ fn main() -> Result<()> {
                 let summary = reconcile_once_with_backup_and_padding(
                     &codex_home,
                     provider.as_deref(),
+                    cli.profile.as_deref(),
                     RolloutScope::AllRows,
                     padding_bytes,
                     Some(RolloutProgressConfig { locale }),
@@ -392,6 +431,7 @@ fn main() -> Result<()> {
                 locale,
                 &codex_home,
                 cli.provider.clone(),
+                cli.profile.clone(),
                 if sqlite_only {
                     RolloutScope::None
                 } else {
@@ -406,6 +446,7 @@ fn main() -> Result<()> {
                 exe_path.as_path(),
                 &codex_home,
                 cli.provider.as_deref(),
+                cli.profile.as_deref(),
                 Duration::from_millis(poll_interval_ms),
             )?;
             println!("{config}");
@@ -415,6 +456,7 @@ fn main() -> Result<()> {
                 locale,
                 &codex_home,
                 cli.provider.as_deref(),
+                cli.profile.as_deref(),
                 Duration::from_millis(poll_interval_ms),
             )?;
         }
@@ -440,6 +482,26 @@ fn validate_provider_override(locale: Locale, provider: Option<&str>) -> Result<
     Ok(())
 }
 
+fn validate_profile_override(locale: Locale, profile: Option<&str>) -> Result<()> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    let trimmed = profile.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(profile_empty_error(locale));
+    }
+    if !is_valid_profile_name(trimmed) {
+        anyhow::bail!(profile_path_error(locale));
+    }
+    Ok(())
+}
+
+fn is_valid_profile_name(profile: &str) -> bool {
+    profile
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn validate_provider_override_args<I, T>(locale: Locale, args: I) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -457,10 +519,19 @@ where
             }
             continue;
         }
+        if arg == OsStr::new("--profile") {
+            if let Some(value) = args.next() {
+                validate_profile_override(locale, value.as_ref().to_str())?;
+            }
+            continue;
+        }
 
         let rendered = arg.to_string_lossy();
         if let Some(value) = rendered.strip_prefix("--provider=") {
             validate_provider_override(locale, Some(value))?;
+        }
+        if let Some(value) = rendered.strip_prefix("--profile=") {
+            validate_profile_override(locale, Some(value))?;
         }
     }
     Ok(())
@@ -504,6 +575,11 @@ fn localized_command(locale: Locale) -> clap::Command {
         arg.help(provider_help(locale))
             .help_heading(options_heading(locale))
             .value_name(provider_value_name(locale))
+    });
+    command = command.mut_arg("profile", |arg| {
+        arg.help(profile_help(locale))
+            .help_heading(options_heading(locale))
+            .value_name(profile_value_name(locale))
     });
 
     command = command.mut_subcommand("status", |sub| {
@@ -698,6 +774,7 @@ fn run_watch(
     locale: Locale,
     codex_home: &Path,
     provider_override: Option<String>,
+    profile_override: Option<String>,
     rollout_scope: RolloutScope,
     poll_interval: Duration,
 ) -> Result<()> {
@@ -738,7 +815,12 @@ fn run_watch(
     }
 
     let mut last_provider = None;
-    match reconcile_once(codex_home, provider_override.as_deref(), rollout_scope) {
+    match reconcile_once(
+        codex_home,
+        provider_override.as_deref(),
+        profile_override.as_deref(),
+        rollout_scope,
+    ) {
         Ok(summary) => {
             print_sync_summary(locale, watch_started_title(locale), &summary);
             last_provider = Some(summary.provider.clone());
@@ -759,7 +841,12 @@ fn run_watch(
         match rx.recv_timeout(timeout) {
             Ok(Ok(event)) => {
                 if touches_config_file(&event, &config_path) {
-                    match reconcile_once(codex_home, provider_override.as_deref(), rollout_scope) {
+                    match reconcile_once(
+                        codex_home,
+                        provider_override.as_deref(),
+                        profile_override.as_deref(),
+                        rollout_scope,
+                    ) {
                         Ok(summary) => {
                             if last_provider.as_deref() != Some(summary.provider.as_str())
                                 || summary.changed_rows > 0
@@ -780,7 +867,12 @@ fn run_watch(
                 eprintln!("{}", watcher_error_message(locale, err));
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                match reconcile_once(codex_home, provider_override.as_deref(), rollout_scope) {
+                match reconcile_once(
+                    codex_home,
+                    provider_override.as_deref(),
+                    profile_override.as_deref(),
+                    rollout_scope,
+                ) {
                     Ok(summary) => {
                         if last_provider.as_deref() != Some(summary.provider.as_str())
                             || summary.changed_rows > 0
@@ -816,12 +908,16 @@ fn touches_config_file(event: &notify::Event, config_path: &Path) -> bool {
     ) && event.paths.iter().any(|path| path == config_path)
 }
 
-fn collect_status(codex_home: &Path, provider_override: Option<&str>) -> Result<StatusSummary> {
+fn collect_status(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
+) -> Result<StatusSummary> {
     let config_path = codex_home.join("config.toml");
-    let sqlite_path = resolve_sqlite_path(codex_home)?;
+    let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
-        None => read_provider_from_config(codex_home)?,
+        None => read_provider_from_config(codex_home, profile_override)?,
     };
     let (total_rows, mismatched_rows, distribution) =
         inspect_sqlite_distribution(&sqlite_path, provider.as_str())?;
@@ -842,22 +938,30 @@ fn collect_status(codex_home: &Path, provider_override: Option<&str>) -> Result<
 fn reconcile_once(
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     rollout_scope: RolloutScope,
 ) -> Result<ReconcileSummary> {
-    reconcile_once_with_progress(codex_home, provider_override, rollout_scope, None)
+    reconcile_once_with_progress(
+        codex_home,
+        provider_override,
+        profile_override,
+        rollout_scope,
+        None,
+    )
 }
 
 fn reconcile_once_with_progress(
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     rollout_scope: RolloutScope,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<ReconcileSummary> {
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
-        None => read_provider_from_config(codex_home)?,
+        None => read_provider_from_config(codex_home, profile_override)?,
     };
-    let sqlite_path = resolve_sqlite_path(codex_home)?;
+    let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
     let started = Instant::now();
     let rollout_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
         &sqlite_path,
@@ -887,12 +991,14 @@ fn reconcile_once_with_progress(
 fn reconcile_once_with_backup_progress(
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     rollout_scope: RolloutScope,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<ReconcileSummary> {
     reconcile_once_with_backup_and_padding(
         codex_home,
         provider_override,
+        profile_override,
         rollout_scope,
         DEFAULT_BUCKET_PADDING_BYTES,
         progress,
@@ -902,15 +1008,16 @@ fn reconcile_once_with_backup_progress(
 fn reconcile_once_with_backup_and_padding(
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     rollout_scope: RolloutScope,
     padding_bytes: usize,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<ReconcileSummary> {
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
-        None => read_provider_from_config(codex_home)?,
+        None => read_provider_from_config(codex_home, profile_override)?,
     };
-    let sqlite_path = resolve_sqlite_path(codex_home)?;
+    let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
     let started = Instant::now();
     let backup_path = create_sqlite_backup_file(&sqlite_path)?;
     let rollout_journal_path =
@@ -949,16 +1056,16 @@ fn reconcile_once_with_backup_and_padding(
     })
 }
 
-fn read_provider_from_config(codex_home: &Path) -> Result<String> {
-    let parsed = read_codex_config(codex_home)?;
+fn read_provider_from_config(codex_home: &Path, profile_override: Option<&str>) -> Result<String> {
+    let parsed = read_effective_codex_config(codex_home, profile_override)?;
     Ok(parsed
         .model_provider
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()))
 }
 
-fn resolve_sqlite_path(codex_home: &Path) -> Result<PathBuf> {
-    let parsed = read_codex_config(codex_home)?;
+fn resolve_sqlite_path(codex_home: &Path, profile_override: Option<&str>) -> Result<PathBuf> {
+    let parsed = read_effective_codex_config(codex_home, profile_override)?;
     let current_dir =
         std::env::current_dir().context("failed to resolve current directory for sqlite_home")?;
     Ok(resolve_sqlite_home_from_config(
@@ -970,18 +1077,75 @@ fn resolve_sqlite_path(codex_home: &Path) -> Result<PathBuf> {
     .join(STATE_DB_FILENAME))
 }
 
-fn read_codex_config(codex_home: &Path) -> Result<ConfigToml> {
-    let config_path = codex_home.join("config.toml");
-    if !config_path.exists() {
-        return Ok(ConfigToml {
-            model_provider: None,
-            sqlite_home: None,
-        });
+fn read_effective_codex_config(
+    codex_home: &Path,
+    profile_override: Option<&str>,
+) -> Result<ConfigToml> {
+    let mut config = read_codex_config(codex_home)?;
+    let active_profile = profile_override
+        .and_then(trimmed_string)
+        .or_else(|| config.profile.as_deref().and_then(trimmed_string));
+
+    if let Some(profile) = active_profile {
+        if !is_valid_profile_name(profile.as_str()) {
+            anyhow::bail!("profile `{profile}` is not a valid Codex profile name");
+        }
+        if let Some(profile_config) = read_profile_v2_config(codex_home, profile.as_str())? {
+            config.overlay(profile_config);
+        } else if let Some(profile_config) = config
+            .profiles
+            .as_ref()
+            .and_then(|profiles| profiles.get(profile.as_str()))
+        {
+            if let Some(provider) = profile_config.model_provider.as_ref() {
+                config.model_provider = Some(provider.clone());
+            }
+        } else {
+            anyhow::bail!(
+                "profile `{}` was not found; expected {} or [profiles.{}] in {}",
+                profile,
+                profile_config_path(codex_home, profile.as_str()).display(),
+                profile,
+                codex_home.join("config.toml").display()
+            );
+        }
     }
 
-    let raw = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse {}", config_path.display()))
+    Ok(config)
+}
+
+fn read_codex_config(codex_home: &Path) -> Result<ConfigToml> {
+    read_optional_config_file(codex_home.join("config.toml").as_path())
+        .map(|config| config.unwrap_or_default())
+}
+
+fn read_profile_v2_config(codex_home: &Path, profile: &str) -> Result<Option<ConfigToml>> {
+    let path = profile_config_path(codex_home, profile);
+    read_optional_config_file(path.as_path())
+}
+
+fn read_optional_config_file(path: &Path) -> Result<Option<ConfigToml>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    toml::from_str(&raw)
+        .map(Some)
+        .with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn profile_config_path(codex_home: &Path, profile: &str) -> PathBuf {
+    codex_home.join(format!("{profile}{PROFILE_CONFIG_SUFFIX}"))
+}
+
+fn trimmed_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn resolve_sqlite_home_from_config(
@@ -1188,8 +1352,12 @@ fn rewrite_rollout_provider_first_line(
     })
 }
 
-fn prepare_bucket_padding(codex_home: &Path, padding_bytes: usize) -> Result<BucketPrepareSummary> {
-    let sqlite_path = resolve_sqlite_path(codex_home)?;
+fn prepare_bucket_padding(
+    codex_home: &Path,
+    profile_override: Option<&str>,
+    padding_bytes: usize,
+) -> Result<BucketPrepareSummary> {
+    let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
     let started = Instant::now();
     let targets = rollout_targets_for_scope(&sqlite_path, DEFAULT_PROVIDER, RolloutScope::AllRows)?;
     let journal_path = codex_home
@@ -1681,6 +1849,7 @@ fn install_service(
     locale: Locale,
     codex_home: &Path,
     provider_override: Option<&str>,
+    profile_override: Option<&str>,
     poll_interval: Duration,
 ) -> Result<()> {
     let exe_path = std::env::current_exe().context(current_exe_error(locale))?;
@@ -1688,6 +1857,7 @@ fn install_service(
         exe_path.as_path(),
         codex_home,
         provider_override,
+        profile_override,
         poll_interval,
     )?;
 
@@ -1963,6 +2133,13 @@ fn provider_value_name(locale: Locale) -> &'static str {
     }
 }
 
+fn profile_value_name(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "PROFILE",
+        Locale::ZhHans => "PROFILE",
+    }
+}
+
 fn milliseconds_value_name(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "MILLISECONDS",
@@ -1991,10 +2168,33 @@ fn provider_help(locale: Locale) -> &'static str {
     }
 }
 
+fn profile_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Resolve model_provider and sqlite_home from a Codex profile config first.",
+        Locale::ZhHans => "优先从 Codex profile 配置解析 model_provider 和 sqlite_home。",
+    }
+}
+
 fn provider_empty_error(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "provider must contain at least one non-whitespace character",
         Locale::ZhHans => "provider 需要包含至少一个非空白字符",
+    }
+}
+
+fn profile_empty_error(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "profile must contain at least one non-whitespace character",
+        Locale::ZhHans => "profile 需要包含至少一个非空白字符",
+    }
+}
+
+fn profile_path_error(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => {
+            "profile must be a plain name containing only ASCII letters, digits, '_' or '-'"
+        }
+        Locale::ZhHans => "profile 需要是只包含 ASCII 字母、数字、'_' 或 '-' 的普通名称",
     }
 }
 
@@ -2652,15 +2852,69 @@ mod tests {
     fn reads_provider_from_config() -> Result<()> {
         let dir = tempfile::tempdir()?;
         fs::write(dir.path().join("config.toml"), "model_provider = \"vm\"\n")?;
-        let provider = read_provider_from_config(dir.path())?;
+        let provider = read_provider_from_config(dir.path(), None)?;
         assert_eq!(provider, "vm");
+        Ok(())
+    }
+
+    #[test]
+    fn reads_provider_from_profile_v2_config() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )?;
+        fs::write(
+            dir.path().join("work.config.toml"),
+            "model_provider = \"bedrock\"\nsqlite_home = \"work-state\"\n",
+        )?;
+
+        let provider = read_provider_from_config(dir.path(), Some("work"))?;
+        let sqlite_path = resolve_sqlite_path(dir.path(), Some("work"))?;
+
+        assert_eq!(provider, "bedrock");
+        assert_eq!(sqlite_path, dir.path().join("work-state/state_5.sqlite"));
+        Ok(())
+    }
+
+    #[test]
+    fn reads_provider_from_selected_legacy_profile() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("config.toml"),
+            r#"
+model_provider = "openai"
+profile = "work"
+
+[profiles.work]
+model_provider = "local"
+"#,
+        )?;
+
+        let provider = read_provider_from_config(dir.path(), None)?;
+
+        assert_eq!(provider, "local");
+        Ok(())
+    }
+
+    #[test]
+    fn errors_when_profile_config_is_missing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::write(
+            dir.path().join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )?;
+
+        let err = read_provider_from_config(dir.path(), Some("missing")).unwrap_err();
+
+        assert!(err.to_string().contains("profile `missing` was not found"));
         Ok(())
     }
 
     #[test]
     fn defaults_to_openai_without_config() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let provider = read_provider_from_config(dir.path())?;
+        let provider = read_provider_from_config(dir.path(), None)?;
         assert_eq!(provider, "openai");
         Ok(())
     }
@@ -2669,7 +2923,7 @@ mod tests {
     fn defaults_to_openai_with_blank_provider_in_config() -> Result<()> {
         let dir = tempfile::tempdir()?;
         fs::write(dir.path().join("config.toml"), "model_provider = \"   \"\n")?;
-        let provider = read_provider_from_config(dir.path())?;
+        let provider = read_provider_from_config(dir.path(), None)?;
         assert_eq!(provider, "openai");
         Ok(())
     }
@@ -2683,7 +2937,7 @@ mod tests {
             format!("sqlite_home = \"{}\"\n", sqlite_home.display()),
         )?;
 
-        let sqlite_path = resolve_sqlite_path(dir.path())?;
+        let sqlite_path = resolve_sqlite_path(dir.path(), None)?;
 
         assert_eq!(sqlite_path, sqlite_home.join("state_5.sqlite"));
         Ok(())
@@ -2732,6 +2986,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_blank_profile_override_in_cli_args_before_help_short_circuit() {
+        let err = validate_provider_override_args(
+            Locale::En,
+            ["codex-threadripper", "--profile", "", "status", "--help"],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("profile must contain"));
+    }
+
+    #[test]
+    fn rejects_path_profile_override_in_cli_args_before_help_short_circuit() {
+        let err = validate_provider_override_args(
+            Locale::En,
+            [
+                "codex-threadripper",
+                "--profile",
+                "nested/work",
+                "status",
+                "--help",
+            ],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("profile must be a plain name"));
+    }
+
+    #[test]
     fn reconcile_once_returns_error_when_db_missing() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let sqlite_path = dir.path().join("state_5.sqlite");
@@ -2740,7 +3020,7 @@ mod tests {
             format!("sqlite_home = \"{}\"\n", dir.path().display()),
         )?;
 
-        let err = reconcile_once(dir.path(), Some("openai"), RolloutScope::None).unwrap_err();
+        let err = reconcile_once(dir.path(), Some("openai"), None, RolloutScope::None).unwrap_err();
 
         assert!(err.to_string().contains(&sqlite_path.display().to_string()));
         assert!(!sqlite_path.exists());
@@ -2940,11 +3220,13 @@ mod tests {
             PathBuf::from("/tmp/codex-threadripper").as_path(),
             PathBuf::from("/tmp/codex-home").as_path(),
             Some("openai"),
+            Some("work"),
             Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
         );
         assert!(plist.contains("dev.wangnov.codex-threadripper"));
         assert!(plist.contains("--codex-home"));
         assert!(plist.contains("--provider"));
+        assert!(plist.contains("--profile"));
         assert!(plist.contains("watch"));
     }
 
