@@ -177,7 +177,7 @@ pub(crate) fn list_backups(sqlite_path: &Path) -> Result<Vec<BackupEntry>> {
         let timestamp_ms = parse_backup_timestamp(&path);
         entries.push(BackupEntry { path, timestamp_ms });
     }
-    entries.sort_by(|a, b| b.timestamp_ms.cmp(&a.timestamp_ms));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.timestamp_ms));
     Ok(entries)
 }
 
