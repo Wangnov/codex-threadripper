@@ -14,6 +14,8 @@ import time
 import zipfile
 
 
+ROLLOUT_PROVIDER_PADDING = " " * 16
+
 SCHEMA_SQL = """
 CREATE TABLE threads (
     id TEXT PRIMARY KEY,
@@ -266,8 +268,10 @@ def prepare_codex_home(codex_home: pathlib.Path) -> None:
 
 
 def write_rollout(path: pathlib.Path, thread_id: str, provider: str) -> None:
+    # The app only rewrites rollout first lines in place when the new line fits.
     path.write_text(
-        f'{{"type":"session_meta","payload":{{"id":"{thread_id}","model_provider":"{provider}"}}}}\n',
+        f'{{"type":"session_meta","payload":{{"id":"{thread_id}","model_provider":"{provider}"}}}}'
+        f"{ROLLOUT_PROVIDER_PADDING}\n",
         encoding="utf-8",
     )
 
@@ -350,6 +354,12 @@ def run_sync(binary_path: pathlib.Path, codex_home: pathlib.Path) -> pathlib.Pat
         raise RuntimeError(f"unexpected sync output\n\n{output}")
     if "Rollouts updated: 2" not in output:
         raise RuntimeError(f"sync did not rewrite rollout metadata\n\n{output}")
+    skipped_line = next(
+        (line for line in output.splitlines() if line.startswith("Rollouts skipped: ")),
+        None,
+    )
+    if skipped_line is not None and not skipped_line.endswith(": 0"):
+        raise RuntimeError(f"sync skipped rollout metadata rewrites\n\n{output}")
 
     backup_line = next(
         (line for line in output.splitlines() if line.startswith("Backup: ")),
