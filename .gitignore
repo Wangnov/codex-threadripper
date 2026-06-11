@@ -4,3 +4,5 @@
 .DS_Store
 .claude/
 .omc/
+__pycache__/
+*.py[cod]
