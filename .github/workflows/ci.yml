@@ -22,3 +22,7 @@ jobs:
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: python -m py_compile scripts/smoke_release.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --check scripts/build-npm-matrix.mjs

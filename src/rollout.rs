@@ -23,6 +23,7 @@ use std::time::Instant;
 use crate::codex_config::DEFAULT_PROVIDER;
 use crate::codex_config::resolve_sqlite_path;
 use crate::fs_sync::sync_dir;
+use crate::fs_sync::with_threadripper_lock;
 use crate::locale::Locale;
 use crate::output::RolloutProgressSnapshot;
 use crate::output::rollout_progress_message;
@@ -159,7 +160,6 @@ struct RolloutChangeJournal {
 #[derive(Clone, Copy)]
 enum RolloutChangeMode {
     InPlace,
-    RewriteWithPadding,
 }
 
 pub(crate) fn reconcile_rollout_metadata_from_sqlite_with_progress(
@@ -271,6 +271,9 @@ fn rewrite_rollout_provider_first_line(
     journal: Option<&mut RolloutChangeJournal>,
     padding_bytes: usize,
 ) -> Result<RolloutPatchOutcome> {
+    let original_metadata = fs::metadata(&target.path)
+        .with_context(|| format!("failed to stat {}", target.path.display()))?;
+    let original_times = file_times_from_metadata(&original_metadata);
     let first_line = read_first_line(&target.path)?;
     let Some(mut value) =
         parse_matching_session_meta(first_line.content.as_slice(), target.thread_id.as_str())?
@@ -304,6 +307,7 @@ fn rewrite_rollout_provider_first_line(
             &target.path,
             replacement.as_slice(),
             first_line.newline.as_slice(),
+            original_times,
         )?;
         return Ok(RolloutPatchOutcome {
             changed: true,
@@ -311,30 +315,24 @@ fn rewrite_rollout_provider_first_line(
         });
     }
 
-    let mut replacement = rendered;
-    replacement.resize(replacement.len() + padding_bytes, b' ');
-    record_rollout_change(
-        journal,
-        target,
-        old_provider.as_str(),
-        provider,
-        first_line.content.len(),
-        replacement.len(),
-        RolloutChangeMode::RewriteWithPadding,
-    )?;
-    rewrite_first_line_atomically(
-        &target.path,
-        replacement.as_slice(),
-        first_line.newline.as_slice(),
-    )?;
+    let _ = padding_bytes;
     Ok(RolloutPatchOutcome {
-        changed: true,
-        prepared: true,
+        skipped: true,
         ..RolloutPatchOutcome::default()
     })
 }
 
 pub(crate) fn prepare_bucket_padding(
+    codex_home: &Path,
+    profile_override: Option<&str>,
+    padding_bytes: usize,
+) -> Result<BucketPrepareSummary> {
+    with_threadripper_lock(codex_home, || {
+        prepare_bucket_padding_unlocked(codex_home, profile_override, padding_bytes)
+    })
+}
+
+fn prepare_bucket_padding_unlocked(
     codex_home: &Path,
     profile_override: Option<&str>,
     padding_bytes: usize,
@@ -376,7 +374,7 @@ pub(crate) fn prepare_bucket_padding(
 
 fn prepare_rollout_first_line_padding(
     target: &RolloutTarget,
-    journal: &mut RolloutChangeJournal,
+    _journal: &mut RolloutChangeJournal,
     padding_bytes: usize,
 ) -> Result<RolloutPatchOutcome> {
     let first_line = read_first_line(&target.path)?;
@@ -388,7 +386,6 @@ fn prepare_rollout_first_line_padding(
             ..RolloutPatchOutcome::default()
         });
     };
-    let old_provider = session_meta_provider(&value).unwrap_or("").to_string();
 
     let rendered = serde_json::to_vec(&value)
         .with_context(|| format!("failed to render {}", target.path.display()))?;
@@ -396,26 +393,8 @@ fn prepare_rollout_first_line_padding(
     if first_line.content.len() >= desired_len {
         return Ok(RolloutPatchOutcome::default());
     }
-
-    let mut replacement = rendered;
-    replacement.resize(desired_len, b' ');
-    record_rollout_change(
-        Some(journal),
-        target,
-        old_provider.as_str(),
-        old_provider.as_str(),
-        first_line.content.len(),
-        replacement.len(),
-        RolloutChangeMode::RewriteWithPadding,
-    )?;
-    rewrite_first_line_atomically(
-        &target.path,
-        replacement.as_slice(),
-        first_line.newline.as_slice(),
-    )?;
     Ok(RolloutPatchOutcome {
-        changed: true,
-        prepared: true,
+        skipped: true,
         ..RolloutPatchOutcome::default()
     })
 }
@@ -457,10 +436,15 @@ fn parse_matching_session_meta(line: &[u8], thread_id: &str) -> Result<Option<Va
     }
 }
 
-fn patch_first_line_in_place(path: &Path, replacement: &[u8], newline: &[u8]) -> Result<()> {
-    let original_times = capture_file_times(path)?;
+fn patch_first_line_in_place(
+    path: &Path,
+    replacement: &[u8],
+    newline: &[u8],
+    original_times: (FileTime, FileTime),
+) -> Result<()> {
     {
         let mut file = OpenOptions::new()
+            .read(true)
             .write(true)
             .open(path)
             .with_context(|| format!("failed to open {}", path.display()))?;
@@ -470,72 +454,11 @@ fn patch_first_line_in_place(path: &Path, replacement: &[u8], newline: &[u8]) ->
             .with_context(|| format!("failed to write {}", path.display()))?;
         file.write_all(newline)
             .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("fsync: {}", path.display()))?;
     }
     restore_file_times(path, original_times)?;
     Ok(())
-}
-
-fn rewrite_first_line_atomically(path: &Path, replacement: &[u8], newline: &[u8]) -> Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("rollout.jsonl");
-    let temp_path = parent.join(format!(
-        ".{file_name}.{}.threadripper.tmp",
-        std::process::id()
-    ));
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    let original_times = file_times_from_metadata(&metadata);
-
-    {
-        let input =
-            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        let mut reader = BufReader::new(input);
-        let mut ignored_first_line = Vec::new();
-        reader
-            .read_until(b'\n', &mut ignored_first_line)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-
-        let output = File::create(&temp_path)
-            .with_context(|| format!("failed to create {}", temp_path.display()))?;
-        fs::set_permissions(&temp_path, metadata.permissions())
-            .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
-        let mut writer = BufWriter::new(output);
-        writer
-            .write_all(replacement)
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        writer
-            .write_all(newline)
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        std::io::copy(&mut reader, &mut writer)
-            .with_context(|| format!("failed to copy {}", path.display()))?;
-        writer
-            .flush()
-            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .with_context(|| format!("fsync: {}", temp_path.display()))?;
-    }
-
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to replace {} with {}",
-            path.display(),
-            temp_path.display()
-        )
-    })?;
-    restore_file_times(path, original_times)?;
-    sync_dir(parent)?;
-    Ok(())
-}
-
-fn capture_file_times(path: &Path) -> Result<(FileTime, FileTime)> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
-    Ok(file_times_from_metadata(&metadata))
 }
 
 fn file_times_from_metadata(metadata: &fs::Metadata) -> (FileTime, FileTime) {
@@ -631,7 +554,6 @@ impl RolloutChangeMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::InPlace => "in_place",
-            Self::RewriteWithPadding => "rewrite_with_padding",
         }
     }
 }

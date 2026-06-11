@@ -51,7 +51,7 @@ fn main() -> Result<()> {
     let cli = parse_cli(locale)?;
     validate_provider_override(locale, cli.provider.as_deref())?;
     validate_profile_override(locale, cli.profile.as_deref())?;
-    let codex_home = cli.codex_home.unwrap_or_else(default_codex_home);
+    let codex_home = resolve_codex_home(cli.codex_home)?;
 
     match cli.command {
         Command::Status => {
@@ -150,9 +150,46 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn default_codex_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+fn resolve_codex_home(cli_codex_home: Option<PathBuf>) -> Result<PathBuf> {
+    resolve_codex_home_from_env(
+        cli_codex_home,
+        std::env::var_os("CODEX_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn resolve_codex_home_from_env(
+    cli_codex_home: Option<PathBuf>,
+    env_codex_home: Option<PathBuf>,
+    env_home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = cli_codex_home {
+        return Ok(path);
+    }
+    if let Some(path) = normalize_codex_home_env(env_codex_home)? {
+        return Ok(path);
+    }
+    Ok(default_codex_home_from_env(env_home))
+}
+
+fn normalize_codex_home_env(env_codex_home: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(path) = env_codex_home else {
+        return Ok(None);
+    };
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    if !path.is_dir() {
+        anyhow::bail!(
+            "CODEX_HOME must point to an existing directory: {}",
+            path.display()
+        );
+    }
+    Ok(Some(path.canonicalize().unwrap_or(path)))
+}
+
+fn default_codex_home_from_env(env_home: Option<PathBuf>) -> PathBuf {
+    env_home
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codex")
 }
