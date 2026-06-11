@@ -204,6 +204,53 @@ fn defaults_to_openai_with_blank_provider_in_config() -> Result<()> {
 }
 
 #[test]
+fn resolves_codex_home_from_cli_then_env_then_home() -> Result<()> {
+    let env_dir = tempfile::tempdir()?;
+    assert_eq!(
+        crate::resolve_codex_home_from_env(
+            Some(PathBuf::from("/cli-codex")),
+            Some(env_dir.path().to_path_buf()),
+            Some(PathBuf::from("/home")),
+        )?,
+        PathBuf::from("/cli-codex")
+    );
+    assert_eq!(
+        crate::resolve_codex_home_from_env(
+            None,
+            Some(env_dir.path().to_path_buf()),
+            Some(PathBuf::from("/home")),
+        )?,
+        env_dir.path().canonicalize()?
+    );
+    assert_eq!(
+        crate::resolve_codex_home_from_env(
+            None,
+            Some(PathBuf::new()),
+            Some(PathBuf::from("/home")),
+        )?,
+        PathBuf::from("/home/.codex")
+    );
+    assert_eq!(
+        crate::resolve_codex_home_from_env(None, None, Some(PathBuf::from("/home")))?,
+        PathBuf::from("/home/.codex")
+    );
+    let invalid_env_path = env_dir.path().join("not-a-directory");
+    fs::write(&invalid_env_path, "not a directory")?;
+    let err = crate::resolve_codex_home_from_env(
+        None,
+        Some(invalid_env_path.clone()),
+        Some(PathBuf::from("/home")),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("CODEX_HOME must point"));
+    assert!(
+        err.to_string()
+            .contains(&invalid_env_path.display().to_string())
+    );
+    Ok(())
+}
+
+#[test]
 fn resolves_sqlite_path_from_config_sqlite_home() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let sqlite_home = dir.path().join("custom-state");
@@ -447,7 +494,7 @@ fn durable_sync_updates_matching_rollout_session_meta() -> Result<()> {
     fs::write(
         &rollout_path,
         concat!(
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}\n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}       \n",
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\",\"model_provider\":\"cong\"}}\n",
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
         ),
@@ -473,6 +520,7 @@ fn durable_sync_updates_matching_rollout_session_meta() -> Result<()> {
         None,
     )?;
 
+    assert_rollout_times(&rollout_path, original_mtime)?;
     let rewritten = fs::read_to_string(&rollout_path)?;
     let journal = fs::read_to_string(&journal_path)?;
     assert_eq!(summary.checked_files, 1);
@@ -481,9 +529,8 @@ fn durable_sync_updates_matching_rollout_session_meta() -> Result<()> {
     assert!(rewritten.contains("\"model_provider\":\"openai\""));
     assert!(rewritten.contains("\"id\":\"other\""));
     assert!(rewritten.contains("\"model_provider\":\"cong\""));
-    assert!(journal.contains("\"mode\":\"rewrite_with_padding\""));
+    assert!(journal.contains("\"mode\":\"in_place\""));
     assert!(journal.contains("cong"));
-    assert_rollout_mtime(&rollout_path, original_mtime)?;
     Ok(())
 }
 
@@ -523,6 +570,7 @@ fn durable_sync_patches_shorter_provider_in_place() -> Result<()> {
         None,
     )?;
 
+    assert_rollout_times(&rollout_path, original_mtime)?;
     let after_len = fs::metadata(&rollout_path)?.len();
     let rewritten = fs::read_to_string(&rollout_path)?;
     let journal = fs::read_to_string(&journal_path)?;
@@ -538,7 +586,91 @@ fn durable_sync_patches_shorter_provider_in_place() -> Result<()> {
             .contains("\"model_provider\":\"cong\"")
     );
     assert!(journal.contains("\"mode\":\"in_place\""));
-    assert_rollout_mtime(&rollout_path, original_mtime)?;
+    Ok(())
+}
+
+#[test]
+fn durable_sync_skips_longer_provider_without_padding() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    let sqlite_path = codex_home.join("state_5.sqlite");
+    let rollout_path = codex_home.join("sessions/2026/05/07/rollout-no-padding.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"vm\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
+        ),
+    )?;
+    seed_sqlite(&sqlite_path)?;
+    let connection = Connection::open(&sqlite_path)?;
+    connection.execute(
+        "UPDATE threads SET rollout_path = ?1, model_provider = 'vm' WHERE id = '1'",
+        [rollout_path.display().to_string()],
+    )?;
+    drop(connection);
+
+    let summary = reconcile_rollout_metadata_from_sqlite_with_progress(
+        &sqlite_path,
+        codex_home,
+        "openai",
+        RolloutScope::AllRows,
+        None,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        None,
+    )?;
+
+    assert_eq!(summary.checked_files, 1);
+    assert_eq!(summary.changed_files, 0);
+    assert_eq!(summary.skipped_files, 1);
+    assert!(fs::read_to_string(&rollout_path)?.contains("\"model_provider\":\"vm\""));
+    Ok(())
+}
+
+#[test]
+fn mismatched_scope_followup_repairs_matching_sqlite_rollout_after_sqlite_changes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    let sqlite_path = codex_home.join("state_5.sqlite");
+    let rollout_a = codex_home.join("sessions/2026/05/07/rollout-a.jsonl");
+    let rollout_b = codex_home.join("sessions/2026/05/07/rollout-b.jsonl");
+    fs::create_dir_all(rollout_a.parent().unwrap())?;
+    fs::write(
+        &rollout_a,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"vm\"}}       \n",
+    )?;
+    fs::write(
+        &rollout_b,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"2\",\"model_provider\":\"cp\"}}       \n",
+    )?;
+    let original_time = FileTime::from_unix_time(1_700_000_200, 0);
+    set_file_times(&rollout_a, original_time, original_time)?;
+    set_file_times(&rollout_b, original_time, original_time)?;
+    seed_sqlite(&sqlite_path)?;
+    let connection = Connection::open(&sqlite_path)?;
+    connection.execute(
+        "UPDATE threads SET rollout_path = ?1, model_provider = 'vm' WHERE id = '1'",
+        [rollout_a.display().to_string()],
+    )?;
+    connection.execute(
+        "UPDATE threads SET rollout_path = ?1, model_provider = 'openai' WHERE id = '2'",
+        [rollout_b.display().to_string()],
+    )?;
+    connection.execute("UPDATE threads SET rollout_path = '' WHERE id = '3'", [])?;
+    drop(connection);
+
+    let summary = reconcile_once(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::MismatchedRows,
+    )?;
+
+    assert_eq!(summary.changed_rows, 1);
+    assert_eq!(summary.changed_rollouts, 2);
+    assert!(fs::read_to_string(&rollout_a)?.contains("\"model_provider\":\"openai\""));
+    assert!(fs::read_to_string(&rollout_b)?.contains("\"model_provider\":\"openai\""));
     Ok(())
 }
 
@@ -755,8 +887,11 @@ fn sqlite_home_config(path: &Path) -> String {
     format!("sqlite_home = \"{path}\"\n")
 }
 
-fn assert_rollout_mtime(path: &Path, expected: FileTime) -> Result<()> {
-    let actual = FileTime::from_last_modification_time(&fs::metadata(path)?);
-    assert_eq!(actual.unix_seconds(), expected.unix_seconds());
+fn assert_rollout_times(path: &Path, expected: FileTime) -> Result<()> {
+    let metadata = fs::metadata(path)?;
+    let actual_atime = FileTime::from_last_access_time(&metadata);
+    let actual_mtime = FileTime::from_last_modification_time(&metadata);
+    assert_eq!(actual_atime.unix_seconds(), expected.unix_seconds());
+    assert_eq!(actual_mtime.unix_seconds(), expected.unix_seconds());
     Ok(())
 }

@@ -1,9 +1,30 @@
 use anyhow::Context;
 use anyhow::Result;
+use fs2::FileExt;
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
+
+pub(crate) fn with_threadripper_lock<T>(
+    codex_home: &Path,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock_path = codex_home.join("threadripper.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    let result = action();
+    lock.unlock()
+        .with_context(|| format!("failed to unlock {}", lock_path.display()))?;
+    result
+}
 
 pub(crate) fn sync_file(path: &Path) -> Result<()> {
     let file = OpenOptions::new()

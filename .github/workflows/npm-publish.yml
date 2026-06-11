@@ -11,7 +11,9 @@ permissions:
 
 jobs:
   publish-npm-matrix:
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -24,7 +26,7 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           mkdir -p dist/release-assets
 
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 90); do
             if gh release download "$TAG" \
               --repo "${{ github.repository }}" \
               --pattern "codex-threadripper-aarch64-apple-darwin.tar.xz" \

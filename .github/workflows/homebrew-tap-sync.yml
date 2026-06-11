@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   sync-homebrew-tap:
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
       TAP_REPO: Wangnov/homebrew-tap
@@ -25,7 +27,7 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           mkdir -p dist/homebrew
 
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 90); do
             if gh release download "$TAG" \
               --repo "${{ github.repository }}" \
               --pattern "$FORMULA_NAME" \

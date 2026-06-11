@@ -7,7 +7,9 @@ use std::time::Instant;
 use crate::cli::DEFAULT_BUCKET_PADDING_BYTES;
 use crate::codex_config::read_provider_from_config;
 use crate::codex_config::resolve_sqlite_path;
+use crate::fs_sync::with_threadripper_lock;
 use crate::rollout::RolloutProgressConfig;
+use crate::rollout::RolloutReconcileSummary;
 use crate::rollout::RolloutScope;
 use crate::rollout::reconcile_rollout_metadata_from_sqlite_with_progress;
 use crate::service;
@@ -92,13 +94,31 @@ fn reconcile_once_with_progress(
     rollout_scope: RolloutScope,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<ReconcileSummary> {
+    with_threadripper_lock(codex_home, || {
+        reconcile_once_with_progress_unlocked(
+            codex_home,
+            provider_override,
+            profile_override,
+            rollout_scope,
+            progress,
+        )
+    })
+}
+
+fn reconcile_once_with_progress_unlocked(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
+    rollout_scope: RolloutScope,
+    progress: Option<RolloutProgressConfig>,
+) -> Result<ReconcileSummary> {
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
         None => read_provider_from_config(codex_home, profile_override)?,
     };
     let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
     let started = Instant::now();
-    let rollout_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
+    let mut rollout_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
         &sqlite_path,
         codex_home,
         provider.as_str(),
@@ -108,6 +128,18 @@ fn reconcile_once_with_progress(
         progress,
     )?;
     let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
+    if rollout_scope == RolloutScope::MismatchedRows && changed_rows > 0 {
+        let followup_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
+            &sqlite_path,
+            codex_home,
+            provider.as_str(),
+            RolloutScope::AllRows,
+            None,
+            DEFAULT_BUCKET_PADDING_BYTES,
+            None,
+        )?;
+        add_rollout_summary(&mut rollout_summary, followup_summary);
+    }
 
     Ok(ReconcileSummary {
         provider,
@@ -141,6 +173,26 @@ pub(crate) fn reconcile_once_with_backup_progress(
 }
 
 pub(crate) fn reconcile_once_with_backup_and_padding(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
+    rollout_scope: RolloutScope,
+    padding_bytes: usize,
+    progress: Option<RolloutProgressConfig>,
+) -> Result<ReconcileSummary> {
+    with_threadripper_lock(codex_home, || {
+        reconcile_once_with_backup_and_padding_unlocked(
+            codex_home,
+            provider_override,
+            profile_override,
+            rollout_scope,
+            padding_bytes,
+            progress,
+        )
+    })
+}
+
+fn reconcile_once_with_backup_and_padding_unlocked(
     codex_home: &Path,
     provider_override: Option<&str>,
     profile_override: Option<&str>,
@@ -189,4 +241,11 @@ pub(crate) fn reconcile_once_with_backup_and_padding(
         backup_path: Some(backup_path),
         rollout_journal_path: rollout_summary.journal_path,
     })
+}
+
+fn add_rollout_summary(summary: &mut RolloutReconcileSummary, extra: RolloutReconcileSummary) {
+    summary.checked_files += extra.checked_files;
+    summary.changed_files += extra.changed_files;
+    summary.prepared_files += extra.prepared_files;
+    summary.skipped_files += extra.skipped_files;
 }

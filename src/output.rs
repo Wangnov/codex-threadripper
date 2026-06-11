@@ -286,8 +286,8 @@ pub(crate) fn bytes_value_name(locale: Locale) -> &'static str {
 
 pub(crate) fn codex_home_help(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Codex home directory. Defaults to $HOME/.codex.",
-        Locale::ZhHans => "Codex home 目录。默认值是 $HOME/.codex。",
+        Locale::En => "Codex home directory. Defaults to CODEX_HOME, then $HOME/.codex.",
+        Locale::ZhHans => "Codex home 目录。默认值依次使用 CODEX_HOME、$HOME/.codex。",
     }
 }
 
@@ -371,8 +371,8 @@ pub(crate) fn bucket_about(locale: Locale) -> &'static str {
 
 pub(crate) fn bucket_prepare_about(locale: Locale) -> &'static str {
     match locale {
-        Locale::En => "Reserve first-line padding so future provider bucket switches stay fast.",
-        Locale::ZhHans => "给首行预留 padding，让后续 provider 桶切换保持快速。",
+        Locale::En => "Inspect first-line padding without growing live rollout files.",
+        Locale::ZhHans => "检查首行 padding，但不扩容仍可能在写入的 rollout 文件。",
     }
 }
 
