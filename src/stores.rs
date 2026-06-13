@@ -73,10 +73,11 @@ pub(crate) fn discover_stores(
 }
 
 /// Pure core of [`discover_stores`]: builds candidates from an already-resolved
-/// configured `sqlite_home`, keeps only files that exist, then canonicalizes and
-/// de-duplicates so the same file is never processed twice (e.g. when
-/// `sqlite_home` resolves to the CLI or App default path). Priority on a path
-/// collision is Configured > App > Cli (first candidate wins the label).
+/// configured `sqlite_home`, keeps existing default files plus an explicit
+/// configured path even when it is missing, then canonicalizes and de-duplicates
+/// so the same file is never processed twice (e.g. when `sqlite_home` resolves
+/// to the CLI or App default path). Priority on a path collision is Configured >
+/// App > Cli (first candidate wins the label).
 pub(crate) fn discover_stores_with(
     codex_home: &Path,
     configured_sqlite_home: Option<&Path>,
@@ -95,6 +96,12 @@ pub(crate) fn discover_stores_with(
     let mut stores: Vec<StoreTarget> = Vec::new();
     for (kind, path) in candidates {
         if !path.exists() {
+            if kind == StoreKind::Configured {
+                stores.push(StoreTarget {
+                    kind,
+                    db_path: path,
+                });
+            }
             continue;
         }
         let canonical = path.canonicalize().unwrap_or(path);

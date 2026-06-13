@@ -448,6 +448,34 @@ fn status_reports_broken_store_without_hiding_healthy_store() -> Result<()> {
 }
 
 #[test]
+fn status_reports_missing_configured_store_alongside_default_store() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::write(
+        home.join("config.toml"),
+        "model_provider = \"openai\"\nsqlite_home = \"missing-state\"\n",
+    )?;
+    let cli_db = home.join("state_5.sqlite");
+    seed_sqlite(&cli_db)?;
+
+    let summary = collect_status(home, Some("openai"), None)?;
+
+    let configured = summary
+        .stores
+        .iter()
+        .find(|store| store.kind == StoreKind::Configured)
+        .expect("configured store present");
+    assert!(configured.error.is_some());
+    let cli = summary
+        .stores
+        .iter()
+        .find(|store| store.kind == StoreKind::Cli)
+        .expect("cli store present");
+    assert_eq!(cli.error, None);
+    Ok(())
+}
+
+#[test]
 fn status_errors_when_every_store_is_broken() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let home = dir.path();
