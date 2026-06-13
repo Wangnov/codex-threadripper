@@ -96,7 +96,11 @@ pub(crate) enum Command {
     UninstallService,
     /// placeholder
     Restore {
-        #[arg(value_name = "BACKUP_PATH", help = "placeholder")]
+        #[arg(
+            value_name = "BACKUP_PATH",
+            help = "placeholder",
+            conflicts_with = "latest"
+        )]
         backup_path: Option<PathBuf>,
         #[arg(long, help = "placeholder")]
         latest: bool,

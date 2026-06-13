@@ -1,10 +1,13 @@
 use anyhow::Context;
 use anyhow::Result;
 use rusqlite::Connection;
+use rusqlite::OpenFlags;
 use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use rusqlite::backup::StepResult;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -165,6 +168,11 @@ pub(crate) fn list_backups(sqlite_path: &Path) -> Result<Vec<BackupEntry>> {
     if !backups_dir.exists() {
         return Ok(Vec::new());
     }
+    let sqlite_name = sqlite_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(STATE_DB_FILENAME);
+    let backup_prefix = format!("{sqlite_name}.");
     let mut entries: Vec<BackupEntry> = Vec::new();
     for entry in fs::read_dir(&backups_dir)
         .with_context(|| format!("failed to read {}", backups_dir.display()))?
@@ -172,6 +180,12 @@ pub(crate) fn list_backups(sqlite_path: &Path) -> Result<Vec<BackupEntry>> {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("bak") {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(&backup_prefix) {
             continue;
         }
         let timestamp_ms = parse_backup_timestamp(&path);
@@ -192,26 +206,72 @@ pub(crate) fn restore_sqlite_from_backup(sqlite_path: &Path, backup_path: &Path)
     if !backup_path.exists() {
         anyhow::bail!("backup file not found: {}", backup_path.display());
     }
-    let source = Connection::open(backup_path)
+    if paths_refer_to_same_file(sqlite_path, backup_path)? {
+        anyhow::bail!(
+            "backup path points to the live database: {}",
+            backup_path.display()
+        );
+    }
+    let source = Connection::open_with_flags(backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open backup {}", backup_path.display()))?;
     source.query_row("SELECT COUNT(*) FROM threads", [], |_| Ok(()))?;
 
-    if sqlite_path.exists() {
-        fs::remove_file(sqlite_path)
-            .with_context(|| format!("failed to remove {}", sqlite_path.display()))?;
+    let mut destination = Connection::open(sqlite_path)
+        .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
+    destination.busy_timeout(Duration::from_millis(5_000))?;
+    let backup = Backup::new(&source, &mut destination)?;
+    let started = Instant::now();
+    let timeout = Duration::from_secs(30);
+
+    loop {
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "sqlite restore timed out after {} seconds for {}",
+                timeout.as_secs(),
+                sqlite_path.display()
+            );
+        }
+
+        match backup.step(100)? {
+            StepResult::Done => break,
+            StepResult::More => {}
+            StepResult::Busy | StepResult::Locked => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {}
+        }
     }
-    fs::copy(backup_path, sqlite_path).with_context(|| {
-        format!(
-            "failed to copy {} to {}",
-            backup_path.display(),
-            sqlite_path.display()
-        )
-    })?;
+
+    drop(backup);
+    drop(destination);
     sync_file(sqlite_path)?;
-    if let Some(parent) = sqlite_path.parent() {
-        sync_dir(parent)?;
-    }
+    let parent = sqlite_path.parent().unwrap_or_else(|| Path::new("."));
+    sync_dir(parent)?;
     Ok(())
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> Result<bool> {
+    if !left.exists() || !right.exists() {
+        return Ok(false);
+    }
+
+    #[cfg(unix)]
+    {
+        let left =
+            fs::metadata(left).with_context(|| format!("failed to stat {}", left.display()))?;
+        let right =
+            fs::metadata(right).with_context(|| format!("failed to stat {}", right.display()))?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let left = fs::canonicalize(left)
+            .with_context(|| format!("failed to resolve {}", left.display()))?;
+        let right = fs::canonicalize(right)
+            .with_context(|| format!("failed to resolve {}", right.display()))?;
+        Ok(left == right)
+    }
 }
 
 pub(crate) fn prune_backups(entries: &[BackupEntry], keep: usize) -> Result<(usize, usize)> {

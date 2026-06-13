@@ -1061,6 +1061,13 @@ pub(crate) fn dry_run_no_changes(locale: Locale) -> &'static str {
     }
 }
 
+pub(crate) fn dry_run_has_no_changes(summary: &crate::sync::DryRunSummary) -> bool {
+    summary.mismatched_rows == 0
+        && summary.rollout_would_update == 0
+        && summary.rollout_would_prepare == 0
+        && summary.rollout_would_skip == 0
+}
+
 pub(crate) fn print_dry_run_summary(locale: Locale, summary: &crate::sync::DryRunSummary) {
     println!("{}", dry_run_title(locale));
     println!(
@@ -1102,10 +1109,7 @@ pub(crate) fn print_dry_run_summary(locale: Locale, summary: &crate::sync::DryRu
             );
         }
     }
-    if summary.mismatched_rows == 0
-        && summary.rollout_would_update == 0
-        && summary.rollout_would_prepare == 0
-    {
+    if dry_run_has_no_changes(summary) {
         println!("{}", dry_run_no_changes(locale));
     }
 }

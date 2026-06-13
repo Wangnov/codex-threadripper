@@ -13,13 +13,18 @@ use crate::locale::Locale;
 use crate::locale::detect_locale_from_sources;
 use crate::locale::parse_apple_languages;
 use crate::locale::parse_locale_tag;
+use crate::output::dry_run_has_no_changes;
 use crate::output::install_next_steps;
 use crate::rollout::RolloutScope;
 use crate::rollout::reconcile_rollout_metadata_from_sqlite_with_progress;
 use crate::service::ServiceManager;
+use crate::state_db::create_sqlite_backup_file;
 use crate::state_db::inspect_sqlite_distribution;
+use crate::state_db::list_backups;
 use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::reconcile_sqlite_with_backup;
+use crate::state_db::restore_sqlite_from_backup;
+use crate::sync::DryRunSummary;
 use crate::sync::reconcile_once;
 use crate::watch::WATCH_FULL_ROLLOUT_POLL_INTERVALS;
 use crate::watch::full_watch_rollout_scope;
@@ -32,6 +37,8 @@ use filetime::FileTime;
 use filetime::set_file_times;
 use rusqlite::Connection;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -365,6 +372,181 @@ fn sync_backup_preserves_pre_reconcile_state() -> Result<()> {
 }
 
 #[test]
+fn restore_sqlite_from_backup_ignores_stale_live_wal() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sqlite_path = dir.path().join("state_5.sqlite");
+    let connection = Connection::open(&sqlite_path)?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.execute(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT)",
+        [],
+    )?;
+    connection.execute("INSERT INTO threads VALUES('old', 'old')", [])?;
+    connection.query_row("PRAGMA wal_checkpoint(FULL)", [], |_| Ok(()))?;
+
+    let backup_path = create_sqlite_backup_file(&sqlite_path)?;
+    connection.execute("INSERT INTO threads VALUES('new', 'new')", [])?;
+
+    let wal_path = sqlite_sidecar_path(&sqlite_path, "-wal");
+    let shm_path = sqlite_sidecar_path(&sqlite_path, "-shm");
+    assert!(wal_path.exists());
+    assert!(shm_path.exists());
+
+    restore_sqlite_from_backup(&sqlite_path, &backup_path)?;
+
+    let restored = Connection::open(&sqlite_path)?;
+    let restored_ids = restored
+        .prepare("SELECT id FROM threads ORDER BY id")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    assert_eq!(restored_ids, vec!["old"]);
+    Ok(())
+}
+
+#[test]
+fn restore_sqlite_from_backup_keeps_existing_connections_on_live_db() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sqlite_path = dir.path().join("state_5.sqlite");
+    let connection = Connection::open(&sqlite_path)?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.execute(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT)",
+        [],
+    )?;
+    connection.execute("INSERT INTO threads VALUES('old', 'old')", [])?;
+    let backup_path = create_sqlite_backup_file(&sqlite_path)?;
+    connection.execute(
+        "INSERT INTO threads VALUES('live_before_restore', 'openai')",
+        [],
+    )?;
+
+    restore_sqlite_from_backup(&sqlite_path, &backup_path)?;
+    connection.execute("INSERT INTO threads VALUES('after_restore', 'openai')", [])?;
+    drop(connection);
+
+    let restored = Connection::open(&sqlite_path)?;
+    let restored_ids = restored
+        .prepare("SELECT id FROM threads ORDER BY id")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    assert_eq!(restored_ids, vec!["after_restore", "old"]);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_sqlite_from_backup_preserves_live_database_permissions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sqlite_path = dir.path().join("state_5.sqlite");
+    seed_sqlite(&sqlite_path)?;
+    fs::set_permissions(&sqlite_path, fs::Permissions::from_mode(0o600))?;
+    let backup_path = create_sqlite_backup_file(&sqlite_path)?;
+
+    restore_sqlite_from_backup(&sqlite_path, &backup_path)?;
+
+    let mode = fs::metadata(&sqlite_path)?.permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_sqlite_from_backup_accepts_read_only_backup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sqlite_path = dir.path().join("state_5.sqlite");
+    seed_sqlite(&sqlite_path)?;
+    let backup_path = create_sqlite_backup_file(&sqlite_path)?;
+    fs::set_permissions(&backup_path, fs::Permissions::from_mode(0o444))?;
+
+    restore_sqlite_from_backup(&sqlite_path, &backup_path)?;
+
+    let connection = Connection::open(&sqlite_path)?;
+    let rows: u64 = connection.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+    assert_eq!(rows, 3);
+    Ok(())
+}
+
+#[test]
+fn restore_sqlite_from_backup_rejects_live_database_path() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sqlite_path = dir.path().join("state_5.sqlite");
+    let connection = Connection::open(&sqlite_path)?;
+    connection.execute(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, model_provider TEXT)",
+        [],
+    )?;
+    connection.execute("INSERT INTO threads VALUES('live', 'openai')", [])?;
+    drop(connection);
+
+    let err = restore_sqlite_from_backup(&sqlite_path, &sqlite_path).unwrap_err();
+    assert!(err.to_string().contains("live database"));
+    let connection = Connection::open(&sqlite_path)?;
+    let rows: u64 = connection.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+    assert_eq!(rows, 1);
+    Ok(())
+}
+
+#[test]
+fn restore_rejects_latest_with_backup_path() {
+    let err = localized_command(Locale::En)
+        .try_get_matches_from([
+            "codex-threadripper",
+            "restore",
+            "--latest",
+            "state_5.sqlite.1.bak",
+        ])
+        .unwrap_err();
+
+    assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+}
+
+#[test]
+fn list_backups_filters_to_selected_database_name() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let sqlite_path = dir.path().join("state_5.sqlite");
+    let backups_dir = dir.path().join("backups");
+    fs::create_dir_all(&backups_dir)?;
+    fs::write(backups_dir.join("state_5.sqlite.300.bak"), b"")?;
+    fs::write(backups_dir.join("state_5.sqlite.unparseable.bak"), b"")?;
+    fs::write(backups_dir.join("other.sqlite.400.bak"), b"")?;
+
+    let backups = list_backups(&sqlite_path)?;
+    let names = backups
+        .iter()
+        .map(|entry| {
+            entry
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        names,
+        vec!["state_5.sqlite.300.bak", "state_5.sqlite.unparseable.bak"]
+    );
+    Ok(())
+}
+
+#[test]
+fn dry_run_no_changes_excludes_skipped_rollouts() {
+    let summary = DryRunSummary {
+        provider: "openai".to_string(),
+        total_rows: 3,
+        mismatched_rows: 0,
+        rollout_would_update: 0,
+        rollout_would_prepare: 0,
+        rollout_would_skip: 1,
+    };
+
+    assert!(!dry_run_has_no_changes(&summary));
+}
+
+#[test]
 fn seed_sqlite_fixture_includes_current_codex_thread_columns() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let sqlite_path = dir.path().join("state_5.sqlite");
@@ -435,6 +617,12 @@ fn seed_sqlite_fixture_includes_current_codex_thread_columns() -> Result<()> {
     assert_eq!(thread_source, "user");
     assert_eq!(preview, "a");
     Ok(())
+}
+
+fn sqlite_sidecar_path(sqlite_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = sqlite_path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 #[test]
