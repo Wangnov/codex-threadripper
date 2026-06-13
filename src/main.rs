@@ -45,6 +45,7 @@ use output::uninstall_launchd_done;
 use rollout::RolloutProgressConfig;
 use rollout::RolloutScope;
 use rollout::prepare_bucket_padding;
+use sync::DEFAULT_BACKFILL_WAIT;
 use sync::ReconcileStatus;
 use sync::collect_status;
 use sync::reconcile_all_stores_with_backup;
@@ -91,10 +92,11 @@ fn run() -> Result<ExitCode> {
                 cli.profile.as_deref(),
                 rollout_scope,
                 DEFAULT_BUCKET_PADDING_BYTES,
+                DEFAULT_BACKFILL_WAIT,
                 progress,
             )?;
             print_multi_sync_summary(locale, sync_complete_title(locale), &summary);
-            if sqlite_only && summary.touches_app_store(&codex_home) {
+            if sqlite_only && summary.app_store_updated(&codex_home) {
                 eprintln!("{}", sqlite_only_app_warning(locale));
             }
             Ok(exit_code_for(summary.status()))
@@ -121,6 +123,7 @@ fn run() -> Result<ExitCode> {
                     cli.profile.as_deref(),
                     RolloutScope::AllRows,
                     padding_bytes,
+                    DEFAULT_BACKFILL_WAIT,
                     Some(RolloutProgressConfig { locale }),
                 )?;
                 print_multi_sync_summary(locale, bucket_switch_complete_title(locale), &summary);
