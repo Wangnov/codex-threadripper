@@ -252,6 +252,9 @@ pub(crate) fn print_multi_sync_summary(
                     );
                 }
             }
+            StoreOutcome::Skipped => {
+                println!("    {}", sync_store_skipped_label(locale));
+            }
             StoreOutcome::Failed { error } => {
                 println!("    {}: {}", sync_store_failed_label(locale), error);
             }
@@ -941,15 +944,26 @@ pub(crate) fn sync_store_failed_label(locale: Locale) -> &'static str {
     }
 }
 
+pub(crate) fn sync_store_skipped_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => {
+            "Skipped — a Codex backfill has not completed; threadripper avoids racing the rebuild. Re-run once Codex finishes (if it keeps skipping, check whether the backfill is stuck)."
+        }
+        Locale::ZhHans => {
+            "已跳过 —— Codex backfill 尚未完成；threadripper 不与重建竞态。待 Codex 完成后重跑（若持续跳过，请检查 backfill 是否卡住）。"
+        }
+    }
+}
+
 pub(crate) fn reconcile_status_line(locale: Locale, status: ReconcileStatus) -> String {
     match (status, locale) {
         (ReconcileStatus::Full, Locale::En) => "Result: all stores updated.".to_string(),
         (ReconcileStatus::Full, Locale::ZhHans) => "结果：所有库均已更新。".to_string(),
         (ReconcileStatus::Partial, Locale::En) => {
-            "Result: PARTIAL — some stores updated, at least one failed (see above). Re-run after resolving the failure.".to_string()
+            "Result: PARTIAL — some stores updated, at least one was skipped or failed (see above). Re-run after it is resolved.".to_string()
         }
         (ReconcileStatus::Partial, Locale::ZhHans) => {
-            "结果：部分成功 —— 部分库已更新，至少一个失败（见上）。解决后请重跑。".to_string()
+            "结果：部分成功 —— 部分库已更新，至少一个被跳过或失败（见上）。解决后请重跑。".to_string()
         }
         (ReconcileStatus::Failed, Locale::En) => {
             "Result: FAILED — no store could be updated.".to_string()

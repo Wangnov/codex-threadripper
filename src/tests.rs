@@ -524,6 +524,7 @@ fn reconcile_all_stores_updates_every_surface_and_dedupes_rollout() -> Result<()
         None,
         RolloutScope::AllRows,
         DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(0),
         None,
     )?;
 
@@ -584,6 +585,7 @@ fn reconcile_all_stores_reports_partial_when_a_store_is_unreadable() -> Result<(
         None,
         RolloutScope::None,
         DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(0),
         None,
     )?;
 
@@ -630,13 +632,14 @@ fn sqlite_only_warning_detects_configured_app_alias() -> Result<()> {
         None,
         RolloutScope::None,
         DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(50),
         None,
     )?;
 
     assert_eq!(summary.status(), ReconcileStatus::Full);
     assert_eq!(summary.stores.len(), 1);
     assert_eq!(summary.stores[0].kind, StoreKind::Configured);
-    assert!(summary.touches_app_store(codex_home));
+    assert!(summary.app_store_updated(codex_home));
     Ok(())
 }
 
@@ -716,6 +719,7 @@ fn reconcile_all_stores_skips_rollout_when_store_backup_fails() -> Result<()> {
         None,
         RolloutScope::AllRows,
         DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(0),
         None,
     );
     fs::set_permissions(app_dir, fs::Permissions::from_mode(original_mode))?;
@@ -768,6 +772,7 @@ fn reconcile_all_stores_fails_store_when_rollout_targets_unreadable() -> Result<
         None,
         RolloutScope::AllRows,
         DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(0),
         None,
     )?;
 
@@ -783,6 +788,195 @@ fn reconcile_all_stores_fails_store_when_rollout_targets_unreadable() -> Result<
         |row| row.get(0),
     )?;
     assert_eq!(provider, "cong");
+    Ok(())
+}
+
+fn seed_store_with_provider(db: &Path, provider: &str) -> Result<()> {
+    seed_sqlite(db)?;
+    let connection = Connection::open(db)?;
+    connection.execute(
+        "UPDATE threads SET model_provider = ?1 WHERE id = '1'",
+        [provider],
+    )?;
+    Ok(())
+}
+
+fn set_backfill_status(db: &Path, status: &str) -> Result<()> {
+    let connection = Connection::open(db)?;
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS backfill_state (id INTEGER PRIMARY KEY, status TEXT NOT NULL)",
+        [],
+    )?;
+    connection.execute(
+        "INSERT OR REPLACE INTO backfill_state (id, status) VALUES (1, ?1)",
+        [status],
+    )?;
+    Ok(())
+}
+
+fn provider_of(db: &Path) -> Result<String> {
+    let connection = Connection::open(db)?;
+    Ok(connection.query_row(
+        "SELECT model_provider FROM threads WHERE id = '1'",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+#[test]
+fn reconcile_all_stores_skips_busy_store_in_sqlite_only() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "cong")?;
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    seed_store_with_provider(&app_db, "cong")?;
+    set_backfill_status(&app_db, "running")?;
+
+    // --sqlite-only (RolloutScope::None) touches no rollout, so the ready CLI
+    // store is still written while the busy App store is skipped.
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::None,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(50),
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Partial);
+    let cli = summary
+        .stores
+        .iter()
+        .find(|store| store.kind == StoreKind::Cli)
+        .expect("cli store present");
+    assert!(matches!(cli.outcome, StoreOutcome::Updated { .. }));
+    let app = summary
+        .stores
+        .iter()
+        .find(|store| store.kind == StoreKind::App)
+        .expect("app store present");
+    assert!(matches!(app.outcome, StoreOutcome::Skipped));
+    assert_eq!(provider_of(&cli_db)?, "openai");
+    assert_eq!(provider_of(&app_db)?, "cong");
+    Ok(())
+}
+
+#[test]
+fn reconcile_all_stores_treats_locked_backfill_status_as_busy() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    fs::write(
+        codex_home.join("config.toml"),
+        sqlite_home_config(codex_home),
+    )?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "cong")?;
+    set_backfill_status(&cli_db, "running")?;
+    let lock = Connection::open(&cli_db)?;
+    lock.execute_batch("BEGIN EXCLUSIVE;")?;
+
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::None,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(0),
+        None,
+    )?;
+    lock.execute_batch("ROLLBACK;")?;
+    drop(lock);
+
+    assert_eq!(summary.status(), ReconcileStatus::Failed);
+    assert!(matches!(summary.stores[0].outcome, StoreOutcome::Skipped));
+    assert_eq!(provider_of(&cli_db)?, "cong");
+    Ok(())
+}
+
+#[test]
+fn reconcile_all_stores_skips_whole_round_when_backfill_running() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    // A rollout shared by both stores' thread "1".
+    let rollout_path = codex_home.join("sessions/2026/05/07/rollout-1.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}        \n",
+    )?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    for db in [&cli_db, &app_db] {
+        seed_store_with_provider(db, "cong")?;
+        let connection = Connection::open(db)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1 WHERE id = '1'",
+            [rollout_path.display().to_string()],
+        )?;
+    }
+    set_backfill_status(&app_db, "running")?;
+
+    // A rollout-rewriting scope (AllRows) while App's backfill runs must skip the
+    // whole round: rewriting the shared rollout would race Codex's rebuild.
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(50),
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Failed);
+    for store in &summary.stores {
+        assert!(matches!(store.outcome, StoreOutcome::Skipped));
+    }
+    // Nothing was touched: both DBs and the shared rollout are unchanged.
+    assert_eq!(provider_of(&cli_db)?, "cong");
+    assert_eq!(provider_of(&app_db)?, "cong");
+    let rollout = fs::read_to_string(&rollout_path)?;
+    assert!(rollout.contains("\"model_provider\":\"cong\""));
+    assert!(!rollout.contains("openai"));
+    Ok(())
+}
+
+#[test]
+fn reconcile_all_stores_treats_complete_backfill_as_ready() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "cong")?;
+    set_backfill_status(&cli_db, "complete")?;
+
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(50),
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Full);
+    assert!(matches!(
+        summary.stores[0].outcome,
+        StoreOutcome::Updated { .. }
+    ));
+    assert_eq!(provider_of(&cli_db)?, "openai");
     Ok(())
 }
 

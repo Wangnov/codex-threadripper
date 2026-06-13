@@ -1,9 +1,13 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+
+use rusqlite::Error as RusqliteError;
+use rusqlite::ErrorCode;
 
 use crate::cli::DEFAULT_BUCKET_PADDING_BYTES;
 use crate::codex_config::read_provider_from_config;
@@ -139,7 +143,7 @@ pub(crate) fn collect_status(
 pub(crate) enum ReconcileStatus {
     /// Every selected store was updated. Exit code 0.
     Full,
-    /// Some stores were updated and at least one failed. Exit code 2.
+    /// Some stores were updated and at least one was skipped or failed. Exit code 2.
     Partial,
     /// No store could be updated. Exit code 1.
     Failed,
@@ -152,6 +156,9 @@ pub(crate) enum StoreOutcome {
         total_rows: u64,
         backup_path: Option<PathBuf>,
     },
+    /// Left untouched because Codex's startup backfill was still running after
+    /// the bounded wait; the user should re-run once the rebuild finishes.
+    Skipped,
     Failed {
         error: String,
     },
@@ -192,28 +199,77 @@ impl MultiReconcileSummary {
         }
     }
 
-    /// True when any selected store is the Codex App surface — used to warn that
+    /// True when the Codex App store was actually updated — used to warn that
     /// `--sqlite-only` edits there may be reverted by Codex's rollout backfill.
-    pub(crate) fn touches_app_store(&self, codex_home: &Path) -> bool {
+    /// A skipped/failed App store did not change, so no warning is needed.
+    pub(crate) fn app_store_updated(&self, codex_home: &Path) -> bool {
         let app_db_path = codex_home
             .join(crate::stores::APP_SQLITE_SUBDIR)
             .join(crate::codex_config::STATE_DB_FILENAME);
         let app_db_path = app_db_path.canonicalize().unwrap_or(app_db_path);
-        self.stores
-            .iter()
-            .any(|store| store.kind == StoreKind::App || store.db_path == app_db_path)
+        self.stores.iter().any(|store| {
+            matches!(store.outcome, StoreOutcome::Updated { .. })
+                && (store.kind == StoreKind::App || store.db_path == app_db_path)
+        })
     }
+}
+
+/// Default bounded wait for an in-progress Codex backfill before a store is
+/// skipped. A one-shot `sync` can afford to pause briefly; if the rebuild is not
+/// done by then the store is skipped and the user re-runs later.
+pub(crate) const DEFAULT_BACKFILL_WAIT: Duration = Duration::from_secs(10);
+
+const BACKFILL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackfillReadiness {
+    Ready,
+    Busy,
+}
+
+/// Wait up to `budget` for a store's Codex startup-backfill to finish before we
+/// write to it, so threadripper never races Codex's rebuild. A store with no
+/// `backfill_state` table (older Codex) or a `complete` status is ready
+/// immediately; a status read error is treated as ready and the write phase
+/// surfaces any real problem.
+fn wait_for_store_backfill(db_path: &Path, budget: Duration) -> BackfillReadiness {
+    let started = Instant::now();
+    loop {
+        match read_backfill_status(db_path) {
+            Ok(None) => return BackfillReadiness::Ready,
+            Ok(Some(status)) if status == "complete" => return BackfillReadiness::Ready,
+            Ok(Some(_)) => {}
+            Err(error) if is_sqlite_lock_error(&error) => {}
+            Err(_) => return BackfillReadiness::Ready,
+        }
+        if started.elapsed() >= budget {
+            return BackfillReadiness::Busy;
+        }
+        std::thread::sleep(BACKFILL_POLL_INTERVAL.min(budget));
+    }
+}
+
+fn is_sqlite_lock_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<RusqliteError>(),
+            Some(RusqliteError::SqliteFailure(error, _))
+                if matches!(error.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        )
+    })
 }
 
 /// Reconcile the provider across **all** discovered stores plus the shared
 /// rollout JSONL, backing up each store first. This is the multi-store write
-/// path for the one-shot `sync` / `bucket switch` commands.
+/// path for the one-shot `sync` / `bucket switch` commands. A store whose Codex
+/// backfill is still running after `backfill_wait` is skipped, not written.
 pub(crate) fn reconcile_all_stores_with_backup(
     codex_home: &Path,
     provider_override: Option<&str>,
     profile_override: Option<&str>,
     rollout_scope: RolloutScope,
     padding_bytes: usize,
+    backfill_wait: Duration,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<MultiReconcileSummary> {
     with_threadripper_lock(codex_home, || {
@@ -223,6 +279,7 @@ pub(crate) fn reconcile_all_stores_with_backup(
             profile_override,
             rollout_scope,
             padding_bytes,
+            backfill_wait,
             progress,
         )
     })
@@ -234,6 +291,7 @@ fn reconcile_all_stores_with_backup_unlocked(
     profile_override: Option<&str>,
     rollout_scope: RolloutScope,
     padding_bytes: usize,
+    backfill_wait: Duration,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<MultiReconcileSummary> {
     let provider = match provider_override {
@@ -255,12 +313,55 @@ fn reconcile_all_stores_with_backup_unlocked(
         "multi-store reconcile expects AllRows or None"
     );
 
-    // 1) Take every per-store backup before touching shared rollout JSONL. If a
-    //    rollout-writing command cannot back up one selected store, skip the
-    //    whole round so no store is left with rewritten rollouts but an old DB.
+    // 0) Backfill guard: a store whose Codex startup-backfill is still running
+    //    after the bounded wait is skipped entirely — we neither collect its
+    //    (possibly partial) rollout targets nor write its DB, so we never race
+    //    the rebuild.
+    let busy: HashSet<PathBuf> = targets
+        .iter()
+        .filter(|target| {
+            wait_for_store_backfill(&target.db_path, backfill_wait) == BackfillReadiness::Busy
+        })
+        .map(|target| target.db_path.clone())
+        .collect();
+
+    // Rewriting any shared rollout JSONL (scope != None) while *any* store's
+    // backfill is running races Codex's rebuild on its own source of truth — the
+    // rollout files it is actively reading. Even a "ready" store's rollouts may
+    // be referenced by the busy store's session. So if we would touch rollouts
+    // and a backfill is in progress, skip the whole round and let the user re-run
+    // once it completes. `--sqlite-only` (RolloutScope::None) touches no rollout,
+    // so its ready stores can still be written below.
+    if rollout_scope != RolloutScope::None && !busy.is_empty() {
+        let stores = targets
+            .iter()
+            .map(|target| StoreReconcileResult {
+                kind: target.kind,
+                db_path: target.db_path.clone(),
+                outcome: StoreOutcome::Skipped,
+            })
+            .collect();
+        return Ok(MultiReconcileSummary {
+            provider,
+            stores,
+            changed_rollouts: 0,
+            checked_rollouts: 0,
+            prepared_rollouts: 0,
+            skipped_rollouts: 0,
+            rollout_journal_path: None,
+            elapsed: started.elapsed(),
+        });
+    }
+
+    // 1) Take every ready store's backup before touching shared rollout JSONL.
+    //    If a rollout-writing command cannot back up one selected store, skip
+    //    the whole round so no store is left with rewritten rollouts but an old DB.
     let mut backup_paths: HashMap<PathBuf, PathBuf> = HashMap::new();
     let mut backup_failed: HashMap<PathBuf, String> = HashMap::new();
-    for target in &targets {
+    for target in targets
+        .iter()
+        .filter(|target| !busy.contains(&target.db_path))
+    {
         match create_store_backup(target) {
             Ok(backup_path) => {
                 backup_paths.insert(target.db_path.clone(), backup_path);
@@ -274,6 +375,13 @@ fn reconcile_all_stores_with_backup_unlocked(
         let stores = targets
             .iter()
             .map(|target| {
+                if busy.contains(&target.db_path) {
+                    return StoreReconcileResult {
+                        kind: target.kind,
+                        db_path: target.db_path.clone(),
+                        outcome: StoreOutcome::Skipped,
+                    };
+                }
                 let error = backup_failed
                     .get(&target.db_path)
                     .cloned()
@@ -301,10 +409,11 @@ fn reconcile_all_stores_with_backup_unlocked(
     }
 
     // 2) Rollout JSONL is the shared, durable source of truth. Collect targets
-    //    across every backed-up store (deduped by canonical path) and rewrite
-    //    once, before any SQLite row is flipped.
-    let store_db_paths: Vec<PathBuf> = targets
+    //    across the ready, backed-up stores (deduped by canonical path) and
+    //    rewrite once, before any SQLite row is flipped.
+    let ready_db_paths: Vec<PathBuf> = targets
         .iter()
+        .filter(|target| !busy.contains(&target.db_path))
         .filter(|target| !backup_failed.contains_key(&target.db_path))
         .map(|target| target.db_path.clone())
         .collect();
@@ -312,7 +421,7 @@ fn reconcile_all_stores_with_backup_unlocked(
         .join("backups")
         .join(format!("rollouts.{}.jsonl", unix_timestamp_millis()?));
     let rollout_outcome = reconcile_rollouts_for_stores(
-        store_db_paths.as_slice(),
+        ready_db_paths.as_slice(),
         provider.as_str(),
         rollout_scope,
         Some(rollout_journal_path.as_path()),
@@ -323,35 +432,41 @@ fn reconcile_all_stores_with_backup_unlocked(
     let rollout_failed: HashMap<PathBuf, String> =
         rollout_outcome.failed_stores.into_iter().collect();
 
-    // 3) Reconcile each backed-up store's SQLite. A store whose rollouts could
-    //    not be read is marked Failed and its DB is left untouched, so we never
-    //    flip a DB while its rollouts stay stale; other per-store failures are
-    //    likewise reported without aborting the healthy stores.
+    // 3) Reconcile each ready, backed-up store's SQLite. A store mid-backfill is
+    //    Skipped; one whose rollouts could not be read is Failed and left
+    //    untouched (so we never flip a DB while its rollouts stay stale); other
+    //    per-store failures are likewise reported without aborting healthy stores.
     let stores: Vec<StoreReconcileResult> = targets
         .iter()
         .map(|target| {
-            if let Some(error) = backup_failed.get(&target.db_path) {
-                return StoreReconcileResult {
+            if busy.contains(&target.db_path) {
+                StoreReconcileResult {
+                    kind: target.kind,
+                    db_path: target.db_path.clone(),
+                    outcome: StoreOutcome::Skipped,
+                }
+            } else if let Some(error) = backup_failed.get(&target.db_path) {
+                StoreReconcileResult {
                     kind: target.kind,
                     db_path: target.db_path.clone(),
                     outcome: StoreOutcome::Failed {
                         error: error.clone(),
                     },
-                };
-            }
-            if let Some(error) = rollout_failed.get(&target.db_path) {
-                return StoreReconcileResult {
+                }
+            } else if let Some(error) = rollout_failed.get(&target.db_path) {
+                StoreReconcileResult {
                     kind: target.kind,
                     db_path: target.db_path.clone(),
                     outcome: StoreOutcome::Failed {
                         error: error.clone(),
                     },
-                };
+                }
+            } else {
+                let backup_path = backup_paths
+                    .remove(&target.db_path)
+                    .expect("backup was prepared for ready store");
+                reconcile_single_store(target, provider.as_str(), backup_path)
             }
-            let backup_path = backup_paths
-                .remove(&target.db_path)
-                .expect("backup was prepared for ready store");
-            reconcile_single_store(target, provider.as_str(), backup_path)
         })
         .collect();
 
