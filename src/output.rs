@@ -49,6 +49,13 @@ pub(crate) fn print_status(locale: Locale, summary: &StatusSummary) {
             status_sqlite_file_label(locale),
             store.db_path.display()
         );
+        if let Some(error) = &store.error {
+            println!("    {}: {}", status_store_error_label(locale), error);
+            if let Some(backfill) = &store.backfill_status {
+                println!("    {}: {}", status_backfill_label(locale), backfill);
+            }
+            continue;
+        }
         println!(
             "    {}: {}",
             status_total_threads_label(locale),
@@ -810,6 +817,13 @@ pub(crate) fn status_backfill_label(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Rebuild (backfill) status",
         Locale::ZhHans => "重建（backfill）状态",
+    }
+}
+
+pub(crate) fn status_store_error_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Inspection failed",
+        Locale::ZhHans => "检查失败",
     }
 }
 

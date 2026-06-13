@@ -22,6 +22,7 @@ use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::reconcile_sqlite_with_backup;
 use crate::stores::StoreKind;
 use crate::stores::discover_stores_with;
+use crate::sync::collect_status;
 use crate::sync::reconcile_once;
 use crate::watch::WATCH_FULL_ROLLOUT_POLL_INTERVALS;
 use crate::watch::full_watch_rollout_scope;
@@ -418,6 +419,35 @@ fn discover_dedupes_symlinked_app_to_cli_default() -> Result<()> {
 }
 
 #[test]
+fn status_reports_broken_store_without_hiding_healthy_store() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    isolate_process_sqlite_home(home)?;
+    let cli_db = home.join("state_5.sqlite");
+    seed_sqlite(&cli_db)?;
+    let app_db = home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    fs::write(&app_db, b"not a sqlite database")?;
+
+    let summary = collect_status(home, Some("openai"), None)?;
+
+    let cli = summary
+        .stores
+        .iter()
+        .find(|store| store.kind == StoreKind::Cli)
+        .expect("cli store present");
+    assert_eq!(cli.total_rows, 3);
+    assert_eq!(cli.error, None);
+    let app = summary
+        .stores
+        .iter()
+        .find(|store| store.kind == StoreKind::App)
+        .expect("app store present");
+    assert!(app.error.is_some());
+    Ok(())
+}
+
+#[test]
 fn rejects_blank_provider_override() {
     let err = validate_provider_override(Locale::En, Some("   ")).unwrap_err();
     assert!(err.to_string().contains("provider must contain"));
@@ -760,6 +790,10 @@ fn durable_sync_skips_longer_provider_without_padding() -> Result<()> {
 fn mismatched_scope_followup_repairs_matching_sqlite_rollout_after_sqlite_changes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let codex_home = dir.path();
+    fs::write(
+        codex_home.join("config.toml"),
+        sqlite_home_config(codex_home),
+    )?;
     let sqlite_path = codex_home.join("state_5.sqlite");
     let rollout_a = codex_home.join("sessions/2026/05/07/rollout-a.jsonl");
     let rollout_b = codex_home.join("sessions/2026/05/07/rollout-b.jsonl");
@@ -1019,6 +1053,14 @@ fn sqlite_home_config(path: &Path) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
     format!("sqlite_home = \"{path}\"\n")
+}
+
+fn isolate_process_sqlite_home(codex_home: &Path) -> Result<()> {
+    fs::write(
+        codex_home.join("config.toml"),
+        "model_provider = \"openai\"\nsqlite_home = \".threadripper-test-missing\"\n",
+    )?;
+    Ok(())
 }
 
 fn assert_rollout_times(path: &Path, expected: FileTime) -> Result<()> {

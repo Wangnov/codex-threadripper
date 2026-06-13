@@ -47,6 +47,7 @@ pub(crate) struct StoreStatus {
     pub(crate) mismatched_rows: u64,
     pub(crate) distribution: ProviderDistribution,
     pub(crate) backfill_status: Option<String>,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -75,20 +76,34 @@ pub(crate) fn collect_status(
     }
     let mut stores = Vec::with_capacity(targets.len());
     for target in targets {
-        let (total_rows, mismatched_rows, distribution) =
-            inspect_sqlite_distribution(&target.db_path, provider.as_str())?;
         // Best-effort: backfill status is auxiliary display info, so a read
         // failure (e.g. a read-only or transiently locked DB during an
         // in-progress rebuild) must not abort the whole status command.
         let backfill_status = read_backfill_status(&target.db_path).ok().flatten();
-        stores.push(StoreStatus {
-            kind: target.kind,
-            db_path: target.db_path,
-            total_rows,
-            mismatched_rows,
-            distribution,
-            backfill_status,
-        });
+        match inspect_sqlite_distribution(&target.db_path, provider.as_str()) {
+            Ok((total_rows, mismatched_rows, distribution)) => {
+                stores.push(StoreStatus {
+                    kind: target.kind,
+                    db_path: target.db_path,
+                    total_rows,
+                    mismatched_rows,
+                    distribution,
+                    backfill_status,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                stores.push(StoreStatus {
+                    kind: target.kind,
+                    db_path: target.db_path,
+                    total_rows: 0,
+                    mismatched_rows: 0,
+                    distribution: ProviderDistribution::default(),
+                    backfill_status,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
     }
 
     let service_status = service::current_service_status()?;
