@@ -30,6 +30,7 @@ use crate::output::watch_stopped_message;
 use crate::output::watcher_disconnected_error;
 use crate::output::watcher_error_message;
 use crate::rollout::RolloutScope;
+use crate::stores::StoreFilter;
 use crate::sync::MultiReconcileSummary;
 use crate::sync::ReconcileStatus;
 use crate::sync::reconcile_all_stores;
@@ -41,6 +42,7 @@ pub(crate) fn run_watch(
     codex_home: &Path,
     provider_override: Option<String>,
     profile_override: Option<String>,
+    store_filter: StoreFilter,
     rollout_scope: RolloutScope,
     poll_interval: Duration,
 ) -> Result<()> {
@@ -89,6 +91,7 @@ pub(crate) fn run_watch(
         profile_override.as_deref(),
         full_rollout_scope,
         Duration::ZERO,
+        store_filter,
         None,
     ) {
         Ok(summary) => {
@@ -118,6 +121,7 @@ pub(crate) fn run_watch(
                         profile_override.as_deref(),
                         full_rollout_scope,
                         Duration::ZERO,
+                        store_filter,
                         None,
                     ) {
                         Ok(summary) => {
@@ -150,6 +154,7 @@ pub(crate) fn run_watch(
                     profile_override.as_deref(),
                     periodic_watch_rollout_scope(rollout_scope, poll_count),
                     Duration::ZERO,
+                    store_filter,
                     None,
                 ) {
                     Ok(summary) => {

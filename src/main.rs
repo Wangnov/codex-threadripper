@@ -25,6 +25,8 @@ use cli::DEFAULT_BUCKET_PADDING_BYTES;
 use cli::parse_cli;
 use cli::validate_profile_override;
 use cli::validate_provider_override;
+use cli::validate_store_filter_rollout_scope;
+use cli::validate_store_filter_supported;
 use locale::Locale;
 use locale::detect_locale;
 use output::bucket_switch_complete_title;
@@ -70,12 +72,17 @@ fn run() -> Result<ExitCode> {
 
     match cli.command {
         Command::Status => {
-            let summary =
-                collect_status(&codex_home, cli.provider.as_deref(), cli.profile.as_deref())?;
+            let summary = collect_status(
+                &codex_home,
+                cli.provider.as_deref(),
+                cli.profile.as_deref(),
+                cli.store,
+            )?;
             print_status(locale, &summary);
             Ok(ExitCode::SUCCESS)
         }
         Command::Sync { sqlite_only } => {
+            validate_store_filter_rollout_scope(locale, cli.store, sqlite_only, "sync")?;
             let rollout_scope = if sqlite_only {
                 RolloutScope::None
             } else {
@@ -93,6 +100,7 @@ fn run() -> Result<ExitCode> {
                 rollout_scope,
                 DEFAULT_BUCKET_PADDING_BYTES,
                 DEFAULT_BACKFILL_WAIT,
+                cli.store,
                 progress,
             )?;
             print_multi_sync_summary(locale, sync_complete_title(locale), &summary);
@@ -103,6 +111,7 @@ fn run() -> Result<ExitCode> {
         }
         Command::Bucket { command } => match command {
             BucketCommand::Prepare { padding_bytes } => {
+                validate_store_filter_supported(locale, cli.store, "bucket prepare")?;
                 let summary =
                     prepare_bucket_padding(&codex_home, cli.profile.as_deref(), padding_bytes)?;
                 print_bucket_prepare_summary(locale, &summary);
@@ -112,6 +121,7 @@ fn run() -> Result<ExitCode> {
                 target_provider,
                 padding_bytes,
             } => {
+                validate_store_filter_rollout_scope(locale, cli.store, false, "bucket switch")?;
                 validate_provider_override(locale, target_provider.as_deref())?;
                 let provider = match target_provider {
                     Some(provider) => Some(provider),
@@ -124,6 +134,7 @@ fn run() -> Result<ExitCode> {
                     RolloutScope::AllRows,
                     padding_bytes,
                     DEFAULT_BACKFILL_WAIT,
+                    cli.store,
                     Some(RolloutProgressConfig { locale }),
                 )?;
                 print_multi_sync_summary(locale, bucket_switch_complete_title(locale), &summary);
@@ -134,11 +145,13 @@ fn run() -> Result<ExitCode> {
             poll_interval_ms,
             sqlite_only,
         } => {
+            validate_store_filter_rollout_scope(locale, cli.store, sqlite_only, "watch")?;
             run_watch(
                 locale,
                 &codex_home,
                 cli.provider.clone(),
                 cli.profile.clone(),
+                cli.store,
                 if sqlite_only {
                     RolloutScope::None
                 } else {
@@ -149,6 +162,7 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::PrintServiceConfig { poll_interval_ms } => {
+            validate_store_filter_supported(locale, cli.store, "print-service-config")?;
             let exe_path = std::env::current_exe().context(current_exe_error(locale))?;
             let config = service::render_service_config(
                 exe_path.as_path(),
@@ -161,6 +175,7 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::InstallService { poll_interval_ms } => {
+            validate_store_filter_supported(locale, cli.store, "install-service")?;
             install_service(
                 locale,
                 &codex_home,
@@ -171,6 +186,7 @@ fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::UninstallService => {
+            validate_store_filter_supported(locale, cli.store, "uninstall-service")?;
             uninstall_service(locale, &codex_home)?;
             Ok(ExitCode::SUCCESS)
         }

@@ -25,10 +25,12 @@ use crate::state_db::read_backfill_status;
 use crate::state_db::read_backfill_status_with_timeout;
 use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::unix_timestamp_millis;
+use crate::stores::StoreFilter;
 use crate::stores::StoreKind;
 use crate::stores::StoreTarget;
 use crate::stores::discover_stores;
 use crate::stores::no_store_found_message;
+use crate::stores::no_store_selected_message;
 
 /// Per-store status for a single discovered `state_5.sqlite` surface.
 #[derive(Debug)]
@@ -55,6 +57,7 @@ pub(crate) fn collect_status(
     codex_home: &Path,
     provider_override: Option<&str>,
     profile_override: Option<&str>,
+    filter: StoreFilter,
 ) -> Result<StatusSummary> {
     let config_path = codex_home.join("config.toml");
     let provider = match provider_override {
@@ -62,8 +65,17 @@ pub(crate) fn collect_status(
         None => read_provider_from_config(codex_home, profile_override)?,
     };
 
-    let targets = discover_stores(codex_home, profile_override)?;
+    let targets = discover_stores(codex_home, profile_override, filter)?;
     if targets.is_empty() {
+        if filter != StoreFilter::All
+            && !discover_stores(codex_home, profile_override, StoreFilter::All)?.is_empty()
+        {
+            anyhow::bail!(no_store_selected_message(
+                detect_locale(),
+                codex_home,
+                filter
+            ));
+        }
         anyhow::bail!(no_store_found_message(detect_locale(), codex_home));
     }
     let mut stores = Vec::with_capacity(targets.len());
@@ -253,6 +265,7 @@ fn is_sqlite_lock_error(error: &anyhow::Error) -> bool {
 /// rollout JSONL, backing up each store first. This is the multi-store write
 /// path for the one-shot `sync` / `bucket switch` commands. A store whose Codex
 /// backfill is still running after `backfill_wait` is skipped, not written.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_all_stores_with_backup(
     codex_home: &Path,
     provider_override: Option<&str>,
@@ -260,6 +273,7 @@ pub(crate) fn reconcile_all_stores_with_backup(
     rollout_scope: RolloutScope,
     padding_bytes: usize,
     backfill_wait: Duration,
+    filter: StoreFilter,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<MultiReconcileSummary> {
     with_threadripper_lock(codex_home, || {
@@ -271,6 +285,7 @@ pub(crate) fn reconcile_all_stores_with_backup(
             padding_bytes,
             backfill_wait,
             true,
+            filter,
             progress,
         )
     })
@@ -281,12 +296,14 @@ pub(crate) fn reconcile_all_stores_with_backup(
 /// every time would be wasteful. Supports the incremental `MismatchedRows` scope
 /// (with an `AllRows` rollout followup when rows change), like the former
 /// single-store watch path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_all_stores(
     codex_home: &Path,
     provider_override: Option<&str>,
     profile_override: Option<&str>,
     rollout_scope: RolloutScope,
     backfill_wait: Duration,
+    filter: StoreFilter,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<MultiReconcileSummary> {
     with_threadripper_lock(codex_home, || {
@@ -298,6 +315,7 @@ pub(crate) fn reconcile_all_stores(
             DEFAULT_BUCKET_PADDING_BYTES,
             backfill_wait,
             false,
+            filter,
             progress,
         )
     })
@@ -312,15 +330,34 @@ fn reconcile_stores_core(
     padding_bytes: usize,
     backfill_wait: Duration,
     backup: bool,
+    filter: StoreFilter,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<MultiReconcileSummary> {
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
         None => read_provider_from_config(codex_home, profile_override)?,
     };
-    let targets = discover_stores(codex_home, profile_override)?;
-    if targets.is_empty() {
+    if filter != StoreFilter::All && rollout_scope != RolloutScope::None {
+        anyhow::bail!(
+            "--store {} can only be used with --sqlite-only because rollout JSONL is shared across stores",
+            filter.slug()
+        );
+    }
+    let all_targets = discover_stores(codex_home, profile_override, StoreFilter::All)?;
+    if all_targets.is_empty() {
         anyhow::bail!(no_store_found_message(detect_locale(), codex_home));
+    }
+    let targets = if filter == StoreFilter::All {
+        all_targets.clone()
+    } else {
+        discover_stores(codex_home, profile_override, filter)?
+    };
+    if targets.is_empty() {
+        anyhow::bail!(no_store_selected_message(
+            detect_locale(),
+            codex_home,
+            filter
+        ));
     }
     let started = Instant::now();
 
@@ -328,7 +365,17 @@ fn reconcile_stores_core(
     //    after the bounded wait is skipped entirely — we neither collect its
     //    (possibly partial) rollout targets nor write its DB, so we never race
     //    the rebuild.
-    let busy: HashSet<PathBuf> = targets
+    //
+    // Rollout JSONL is shared across CLI/App/configured stores, so any
+    // rollout-rewriting scope must guard every discovered store, even if
+    // `--store` selected just one of them. `--sqlite-only` touches no rollout,
+    // so it only waits on and skips the selected stores.
+    let backfill_guard_targets: &[StoreTarget] = if rollout_scope == RolloutScope::None {
+        targets.as_slice()
+    } else {
+        all_targets.as_slice()
+    };
+    let busy: HashSet<PathBuf> = backfill_guard_targets
         .iter()
         .filter(|target| {
             wait_for_store_backfill(&target.db_path, backfill_wait) == BackfillReadiness::Busy
@@ -498,7 +545,7 @@ fn reconcile_stores_core(
         })
         .collect();
 
-    // 3) MismatchedRows is incremental: the first pass only rewrote rollouts for
+    // 4) MismatchedRows is incremental: the first pass only rewrote rollouts for
     //    rows the DB had marked mismatched. After flipping those rows, run a full
     //    AllRows rollout pass so any rollout that drifted is corrected too. (busy
     //    is empty here — the whole-round skip above already returned if a backfill

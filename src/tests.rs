@@ -6,6 +6,8 @@ use crate::cli::DEFAULT_POLL_INTERVAL_MS;
 use crate::cli::localized_command;
 use crate::cli::validate_provider_override;
 use crate::cli::validate_provider_override_args;
+use crate::cli::validate_store_filter_rollout_scope;
+use crate::cli::validate_store_filter_supported;
 use crate::codex_config::read_provider_from_config;
 use crate::codex_config::resolve_sqlite_home_from_config;
 use crate::codex_config::resolve_sqlite_path;
@@ -21,7 +23,9 @@ use crate::service::ServiceManager;
 use crate::state_db::inspect_sqlite_distribution;
 use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::reconcile_sqlite_with_backup;
+use crate::stores::StoreFilter;
 use crate::stores::StoreKind;
+use crate::stores::discover_stores;
 use crate::stores::discover_stores_with;
 use crate::sync::MultiReconcileSummary;
 use crate::sync::ReconcileStatus;
@@ -383,6 +387,41 @@ fn discover_dedupes_configured_pointing_at_app_default() -> Result<()> {
 }
 
 #[test]
+fn store_filter_keeps_cli_when_configured_aliases_cli_default() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::write(home.join("config.toml"), "sqlite_home = \".\"\n")?;
+    fs::write(home.join("state_5.sqlite"), b"")?;
+
+    let stores = discover_stores(home, None, StoreFilter::Cli)?;
+
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].kind, StoreKind::Cli);
+    let all = discover_stores(home, None, StoreFilter::All)?;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].kind, StoreKind::Configured);
+    Ok(())
+}
+
+#[test]
+fn store_filter_keeps_app_when_configured_aliases_app_default() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::write(home.join("config.toml"), "sqlite_home = \"sqlite\"\n")?;
+    fs::create_dir_all(home.join("sqlite"))?;
+    fs::write(home.join("sqlite").join("state_5.sqlite"), b"")?;
+
+    let stores = discover_stores(home, None, StoreFilter::App)?;
+
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].kind, StoreKind::App);
+    let all = discover_stores(home, None, StoreFilter::All)?;
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].kind, StoreKind::Configured);
+    Ok(())
+}
+
+#[test]
 fn discover_orders_configured_app_cli_when_all_distinct() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let home = dir.path();
@@ -437,7 +476,7 @@ fn status_reports_broken_store_without_hiding_healthy_store() -> Result<()> {
     fs::create_dir_all(app_db.parent().unwrap())?;
     fs::write(&app_db, b"not a sqlite database")?;
 
-    let summary = collect_status(home, Some("openai"), None)?;
+    let summary = collect_status(home, Some("openai"), None, StoreFilter::All)?;
 
     let cli = summary
         .stores
@@ -466,7 +505,7 @@ fn status_reports_missing_configured_store_alongside_default_store() -> Result<(
     let cli_db = home.join("state_5.sqlite");
     seed_sqlite(&cli_db)?;
 
-    let summary = collect_status(home, Some("openai"), None)?;
+    let summary = collect_status(home, Some("openai"), None, StoreFilter::All)?;
 
     let configured = summary
         .stores
@@ -490,7 +529,7 @@ fn status_errors_when_every_store_is_broken() -> Result<()> {
     fs::write(home.join("config.toml"), sqlite_home_config(home))?;
     fs::write(home.join("state_5.sqlite"), b"not a sqlite database")?;
 
-    let err = collect_status(home, Some("openai"), None).unwrap_err();
+    let err = collect_status(home, Some("openai"), None, StoreFilter::All).unwrap_err();
 
     assert!(err.to_string().contains("failed to inspect any"));
     Ok(())
@@ -529,6 +568,7 @@ fn reconcile_all_stores_updates_every_surface_and_dedupes_rollout() -> Result<()
         RolloutScope::AllRows,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     )?;
 
@@ -590,6 +630,7 @@ fn reconcile_all_stores_reports_partial_when_a_store_is_unreadable() -> Result<(
         RolloutScope::None,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     )?;
 
@@ -637,6 +678,7 @@ fn sqlite_only_warning_detects_configured_app_alias() -> Result<()> {
         RolloutScope::None,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(50),
+        StoreFilter::All,
         None,
     )?;
 
@@ -724,6 +766,7 @@ fn reconcile_all_stores_skips_rollout_when_store_backup_fails() -> Result<()> {
         RolloutScope::AllRows,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     );
     fs::set_permissions(app_dir, fs::Permissions::from_mode(original_mode))?;
@@ -777,6 +820,7 @@ fn reconcile_all_stores_fails_store_when_rollout_targets_unreadable() -> Result<
         RolloutScope::AllRows,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     )?;
 
@@ -849,6 +893,7 @@ fn reconcile_all_stores_skips_busy_store_in_sqlite_only() -> Result<()> {
         RolloutScope::None,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(50),
+        StoreFilter::All,
         None,
     )?;
 
@@ -893,6 +938,7 @@ fn reconcile_all_stores_treats_locked_backfill_status_as_busy() -> Result<()> {
         RolloutScope::None,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     )?;
     let elapsed = started.elapsed();
@@ -942,6 +988,7 @@ fn reconcile_all_stores_skips_whole_round_when_backfill_running() -> Result<()> 
         RolloutScope::AllRows,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(50),
+        StoreFilter::All,
         None,
     )?;
 
@@ -975,6 +1022,7 @@ fn reconcile_all_stores_treats_complete_backfill_as_ready() -> Result<()> {
         RolloutScope::AllRows,
         DEFAULT_BUCKET_PADDING_BYTES,
         Duration::from_millis(50),
+        StoreFilter::All,
         None,
     )?;
 
@@ -1017,6 +1065,7 @@ fn reconcile_all_stores_writes_no_journal_without_backup() -> Result<()> {
         None,
         RolloutScope::AllRows,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     )?;
 
@@ -1034,6 +1083,171 @@ fn reconcile_all_stores_writes_no_journal_without_backup() -> Result<()> {
         0
     };
     assert_eq!(journal_count, 0);
+    Ok(())
+}
+
+#[test]
+fn store_filter_limits_reconcile_to_selected_surface() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "cong")?;
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    seed_store_with_provider(&app_db, "cong")?;
+
+    // `--store cli` reconciles only the CLI surface; the App store is untouched.
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::None,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(0),
+        StoreFilter::Cli,
+        None,
+    )?;
+
+    assert_eq!(summary.stores.len(), 1);
+    assert_eq!(summary.stores[0].kind, StoreKind::Cli);
+    assert_eq!(provider_of(&cli_db)?, "openai");
+    assert_eq!(provider_of(&app_db)?, "cong");
+    Ok(())
+}
+
+#[test]
+fn store_filter_reconciles_cli_when_configured_aliases_cli_default() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    fs::write(codex_home.join("config.toml"), "sqlite_home = \".\"\n")?;
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "cong")?;
+
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::None,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(0),
+        StoreFilter::Cli,
+        None,
+    )?;
+
+    assert_eq!(summary.stores.len(), 1);
+    assert_eq!(summary.stores[0].kind, StoreKind::Cli);
+    assert_eq!(provider_of(&cli_db)?, "openai");
+    Ok(())
+}
+
+#[test]
+fn store_filter_reconciles_app_when_configured_aliases_app_default() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    fs::write(codex_home.join("config.toml"), "sqlite_home = \"sqlite\"\n")?;
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    seed_store_with_provider(&app_db, "cong")?;
+
+    let summary = reconcile_all_stores(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::None,
+        Duration::from_millis(0),
+        StoreFilter::App,
+        None,
+    )?;
+
+    assert_eq!(summary.stores.len(), 1);
+    assert_eq!(summary.stores[0].kind, StoreKind::App);
+    assert_eq!(provider_of(&app_db)?, "openai");
+    Ok(())
+}
+
+#[test]
+fn store_filter_rejects_rollout_writing_scope() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    let rollout_path = codex_home.join("sessions/2026/05/07/rollout-1.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}        \n",
+    )?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "cong")?;
+    {
+        let connection = Connection::open(&cli_db)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1 WHERE id = '1'",
+            [rollout_path.display().to_string()],
+        )?;
+    }
+
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    seed_store_with_provider(&app_db, "cong")?;
+
+    let err = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        Duration::from_millis(50),
+        StoreFilter::Cli,
+        None,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("--sqlite-only"));
+    assert_eq!(provider_of(&cli_db)?, "cong");
+    assert_eq!(provider_of(&app_db)?, "cong");
+    let rollout = fs::read_to_string(&rollout_path)?;
+    assert!(rollout.contains("\"model_provider\":\"cong\""));
+    assert!(!rollout.contains("openai"));
+    Ok(())
+}
+
+#[test]
+fn rejects_store_filter_for_commands_that_do_not_select_stores() {
+    let err = validate_store_filter_supported(Locale::En, StoreFilter::App, "install-service")
+        .unwrap_err();
+    assert!(err.to_string().contains("--store is not supported"));
+    assert!(err.to_string().contains("install-service"));
+    assert!(!err.to_string().contains("bucket switch"));
+
+    validate_store_filter_supported(Locale::En, StoreFilter::All, "install-service").unwrap();
+}
+
+#[test]
+fn rejects_store_filter_for_rollout_writing_commands() {
+    let err = validate_store_filter_rollout_scope(Locale::En, StoreFilter::Cli, false, "sync")
+        .unwrap_err();
+    assert!(err.to_string().contains("--sqlite-only"));
+    assert!(err.to_string().contains("sync"));
+
+    validate_store_filter_rollout_scope(Locale::En, StoreFilter::Cli, true, "sync").unwrap();
+    validate_store_filter_rollout_scope(Locale::En, StoreFilter::All, false, "sync").unwrap();
+}
+
+#[test]
+fn status_reports_when_store_filter_matches_no_detected_store() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "openai")?;
+
+    let err = collect_status(codex_home, Some("openai"), None, StoreFilter::App).unwrap_err();
+
+    assert!(err.to_string().contains("--store app"));
+    assert!(!err.to_string().contains("run Codex at least once"));
     Ok(())
 }
 
@@ -1093,6 +1307,7 @@ fn reconcile_all_stores_reports_missing_configured_store_as_failed() -> Result<(
         None,
         RolloutScope::None,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     )?;
 
@@ -1397,10 +1612,7 @@ fn durable_sync_skips_longer_provider_without_padding() -> Result<()> {
 fn mismatched_scope_followup_repairs_matching_sqlite_rollout_after_sqlite_changes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let codex_home = dir.path();
-    fs::write(
-        codex_home.join("config.toml"),
-        sqlite_home_config(codex_home),
-    )?;
+    isolate_process_sqlite_home(codex_home)?;
     let sqlite_path = codex_home.join("state_5.sqlite");
     let rollout_a = codex_home.join("sessions/2026/05/07/rollout-a.jsonl");
     let rollout_b = codex_home.join("sessions/2026/05/07/rollout-b.jsonl");
@@ -1435,6 +1647,7 @@ fn mismatched_scope_followup_repairs_matching_sqlite_rollout_after_sqlite_change
         None,
         RolloutScope::MismatchedRows,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     )?;
 
@@ -1493,6 +1706,7 @@ fn mismatched_scope_followup_excludes_failed_stores() -> Result<()> {
         None,
         RolloutScope::MismatchedRows,
         Duration::from_millis(0),
+        StoreFilter::All,
         None,
     )?;
 

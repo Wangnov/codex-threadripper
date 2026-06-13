@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use crate::codex_config::is_valid_profile_name;
 use crate::locale::Locale;
 use crate::output::*;
+use crate::stores::StoreFilter;
 
 pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const DEFAULT_POLL_INTERVAL_MS: u64 = 500;
@@ -35,6 +36,16 @@ pub(crate) struct Cli {
 
     #[arg(long, global = true, value_name = "PROFILE", help = "placeholder")]
     pub(crate) profile: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value_t = StoreFilter::All,
+        value_name = "STORE",
+        help = "placeholder"
+    )]
+    pub(crate) store: StoreFilter,
 
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -163,6 +174,11 @@ pub(crate) fn localized_command(locale: Locale) -> clap::Command {
         arg.help(profile_help(locale))
             .help_heading(options_heading(locale))
             .value_name(profile_value_name(locale))
+    });
+    command = command.mut_arg("store", |arg| {
+        arg.help(store_help(locale))
+            .help_heading(options_heading(locale))
+            .value_name(store_value_name(locale))
     });
 
     command = command.mut_subcommand("status", |sub| {
@@ -302,6 +318,29 @@ pub(crate) fn validate_profile_override(locale: Locale, profile: Option<&str>) -
     }
     if !is_valid_profile_name(trimmed) {
         anyhow::bail!(profile_path_error(locale));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_store_filter_supported(
+    locale: Locale,
+    store: StoreFilter,
+    command: &str,
+) -> Result<()> {
+    if store != StoreFilter::All {
+        anyhow::bail!(store_filter_unsupported_error(locale, command));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_store_filter_rollout_scope(
+    locale: Locale,
+    store: StoreFilter,
+    sqlite_only: bool,
+    command: &str,
+) -> Result<()> {
+    if store != StoreFilter::All && !sqlite_only {
+        anyhow::bail!(store_filter_requires_sqlite_only_error(locale, command));
     }
     Ok(())
 }

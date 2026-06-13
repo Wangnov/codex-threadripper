@@ -61,15 +61,56 @@ pub(crate) struct StoreTarget {
     pub(crate) db_path: PathBuf,
 }
 
+/// `--store` selector: narrow which discovered surface(s) a command operates on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum StoreFilter {
+    /// Every discovered store (default).
+    #[default]
+    All,
+    /// Only the Codex CLI default (`<codex_home>/state_5.sqlite`).
+    Cli,
+    /// Only the Codex App store (`<codex_home>/sqlite/state_5.sqlite`).
+    App,
+    /// Only an explicit `sqlite_home` / `CODEX_SQLITE_HOME` store.
+    Configured,
+}
+
+impl StoreFilter {
+    pub(crate) fn slug(self) -> &'static str {
+        match self {
+            StoreFilter::All => "all",
+            StoreFilter::Cli => "cli",
+            StoreFilter::App => "app",
+            StoreFilter::Configured => "configured",
+        }
+    }
+
+    pub(crate) fn matches(self, kind: StoreKind) -> bool {
+        match self {
+            StoreFilter::All => true,
+            StoreFilter::Cli => kind == StoreKind::Cli,
+            StoreFilter::App => kind == StoreKind::App,
+            StoreFilter::Configured => kind == StoreKind::Configured,
+        }
+    }
+}
+
 /// Discover every existing `state_5.sqlite` store under `codex_home`,
 /// canonicalized and de-duplicated. Reads the configured `sqlite_home` /
 /// `CODEX_SQLITE_HOME` (if any) and then layers the App and CLI defaults.
 pub(crate) fn discover_stores(
     codex_home: &Path,
     profile_override: Option<&str>,
+    filter: StoreFilter,
 ) -> Result<Vec<StoreTarget>> {
     let configured = configured_sqlite_home(codex_home, profile_override)?;
-    Ok(discover_stores_with(codex_home, configured.as_deref()))
+    if filter == StoreFilter::All {
+        return Ok(discover_stores_with(codex_home, configured.as_deref()));
+    }
+    let candidates = store_candidates(codex_home, configured.as_deref())
+        .into_iter()
+        .filter(|(kind, _)| filter.matches(*kind));
+    Ok(discover_stores_from_candidates(candidates))
 }
 
 /// Pure core of [`discover_stores`]: builds candidates from an already-resolved
@@ -82,6 +123,13 @@ pub(crate) fn discover_stores_with(
     codex_home: &Path,
     configured_sqlite_home: Option<&Path>,
 ) -> Vec<StoreTarget> {
+    discover_stores_from_candidates(store_candidates(codex_home, configured_sqlite_home))
+}
+
+fn store_candidates(
+    codex_home: &Path,
+    configured_sqlite_home: Option<&Path>,
+) -> Vec<(StoreKind, PathBuf)> {
     let mut candidates: Vec<(StoreKind, PathBuf)> = Vec::new();
     if let Some(dir) = configured_sqlite_home {
         candidates.push((StoreKind::Configured, dir.join(STATE_DB_FILENAME)));
@@ -91,7 +139,13 @@ pub(crate) fn discover_stores_with(
         codex_home.join(APP_SQLITE_SUBDIR).join(STATE_DB_FILENAME),
     ));
     candidates.push((StoreKind::Cli, codex_home.join(STATE_DB_FILENAME)));
+    candidates
+}
 
+fn discover_stores_from_candidates<I>(candidates: I) -> Vec<StoreTarget>
+where
+    I: IntoIterator<Item = (StoreKind, PathBuf)>,
+{
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut stores: Vec<StoreTarget> = Vec::new();
     for (kind, path) in candidates {
@@ -125,6 +179,26 @@ pub(crate) fn no_store_found_message(locale: Locale, codex_home: &Path) -> Strin
         Locale::ZhHans => format!(
             "在 {} 下未找到 Codex 状态库(已查 state_5.sqlite 与 sqlite/state_5.sqlite)— 请先运行一次 Codex 以生成它",
             codex_home.display()
+        ),
+    }
+}
+
+/// Error message shown when stores exist, but none match the selected `--store`.
+pub(crate) fn no_store_selected_message(
+    locale: Locale,
+    codex_home: &Path,
+    filter: StoreFilter,
+) -> String {
+    match locale {
+        Locale::En => format!(
+            "no Codex state database under {} matched --store {}; run `codex-threadripper status --store all` to see detected stores",
+            codex_home.display(),
+            filter.slug()
+        ),
+        Locale::ZhHans => format!(
+            "{} 下没有匹配 --store {} 的 Codex 状态库；可运行 `codex-threadripper status --store all` 查看已发现的存储面",
+            codex_home.display(),
+            filter.slug()
         ),
     }
 }

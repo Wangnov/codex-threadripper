@@ -29,6 +29,7 @@ use crate::output::RolloutProgressSnapshot;
 use crate::output::rollout_progress_message;
 use crate::state_db::ensure_sqlite_exists;
 use crate::state_db::unix_timestamp_millis;
+use crate::stores::StoreFilter;
 use crate::stores::discover_stores;
 
 const ROLLOUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
@@ -415,7 +416,7 @@ fn prepare_bucket_padding_unlocked(
     padding_bytes: usize,
 ) -> Result<BucketPrepareSummary> {
     let started = Instant::now();
-    let store_db_paths = discover_stores(codex_home, profile_override)?
+    let store_db_paths = discover_stores(codex_home, profile_override, StoreFilter::All)?
         .into_iter()
         .map(|store| store.db_path)
         .collect::<Vec<_>>();

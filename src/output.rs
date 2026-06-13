@@ -311,6 +311,22 @@ pub(crate) fn provider_value_name(locale: Locale) -> &'static str {
     }
 }
 
+pub(crate) fn store_value_name(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "STORE",
+        Locale::ZhHans => "STORE",
+    }
+}
+
+pub(crate) fn store_help(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => {
+            "Limit which storage surface to operate on: cli, app, configured, or all (default: all); filtered writes require --sqlite-only"
+        }
+        Locale::ZhHans => "限定操作的存储面：cli、app、configured 或 all（默认：all）",
+    }
+}
+
 pub(crate) fn profile_value_name(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "PROFILE",
@@ -377,6 +393,32 @@ pub(crate) fn profile_path_error(locale: Locale) -> &'static str {
             "profile must be a plain name containing only ASCII letters, digits, '_' or '-'"
         }
         Locale::ZhHans => "profile 需要是只包含 ASCII 字母、数字、'_' 或 '-' 的普通名称",
+    }
+}
+
+pub(crate) fn store_filter_unsupported_error(locale: Locale, command: &str) -> String {
+    match locale {
+        Locale::En => format!(
+            "--store is not supported for `{command}`; use --store only with status, sync --sqlite-only, or watch --sqlite-only"
+        ),
+        Locale::ZhHans => {
+            format!(
+                "--store 不支持 `{command}`；它只能用于 status、sync --sqlite-only 或 watch --sqlite-only"
+            )
+        }
+    }
+}
+
+pub(crate) fn store_filter_requires_sqlite_only_error(locale: Locale, command: &str) -> String {
+    match locale {
+        Locale::En => format!(
+            "--store on `{command}` can only be used with --sqlite-only because rollout JSONL is shared across stores"
+        ),
+        Locale::ZhHans => {
+            format!(
+                "`{command}` 使用 --store 时必须同时使用 --sqlite-only，因为 rollout JSONL 在多个库之间共享"
+            )
+        }
     }
 }
 
