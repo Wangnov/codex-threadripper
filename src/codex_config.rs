@@ -68,6 +68,24 @@ pub(crate) fn resolve_sqlite_path(
     .join(STATE_DB_FILENAME))
 }
 
+/// Returns the explicitly configured sqlite home (config `sqlite_home` or the
+/// `CODEX_SQLITE_HOME` env var) if set, otherwise `None`. Used to detect the
+/// "configured" storage surface during multi-store discovery.
+pub(crate) fn configured_sqlite_home(
+    codex_home: &Path,
+    profile_override: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    let parsed = read_effective_codex_config(codex_home, profile_override)?;
+    let current_dir =
+        std::env::current_dir().context("failed to resolve current directory for sqlite_home")?;
+    Ok(configured_sqlite_home_from(
+        codex_home,
+        parsed.sqlite_home.as_deref(),
+        std::env::var(CODEX_SQLITE_HOME_ENV).ok().as_deref(),
+        current_dir.as_path(),
+    ))
+}
+
 fn read_effective_codex_config(
     codex_home: &Path,
     profile_override: Option<&str>,
@@ -176,13 +194,26 @@ pub(crate) fn resolve_sqlite_home_from_config(
     env_sqlite_home: Option<&str>,
     current_dir: &Path,
 ) -> PathBuf {
+    configured_sqlite_home_from(codex_home, config_sqlite_home, env_sqlite_home, current_dir)
+        .unwrap_or_else(|| codex_home.to_path_buf())
+}
+
+/// Like [`resolve_sqlite_home_from_config`] but returns `None` for the default
+/// branch, so callers can distinguish an explicit `sqlite_home` /
+/// `CODEX_SQLITE_HOME` override from the implicit `codex_home` fallback.
+pub(crate) fn configured_sqlite_home_from(
+    codex_home: &Path,
+    config_sqlite_home: Option<&str>,
+    env_sqlite_home: Option<&str>,
+    current_dir: &Path,
+) -> Option<PathBuf> {
     if let Some(path) = config_sqlite_home.and_then(trimmed_path) {
-        return resolve_path_relative_to(path, codex_home);
+        return Some(resolve_path_relative_to(path, codex_home));
     }
     if let Some(path) = env_sqlite_home.and_then(trimmed_path) {
-        return resolve_path_relative_to(path, current_dir);
+        return Some(resolve_path_relative_to(path, current_dir));
     }
-    codex_home.to_path_buf()
+    None
 }
 
 fn trimmed_path(value: &str) -> Option<&Path> {

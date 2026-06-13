@@ -1,6 +1,8 @@
 use anyhow::Context;
 use anyhow::Result;
 use rusqlite::Connection;
+use rusqlite::OpenFlags;
+use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use rusqlite::backup::StepResult;
@@ -40,6 +42,43 @@ pub(crate) fn inspect_sqlite_distribution(
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<Vec<(String, u64)>>>()?;
     Ok((total_rows, mismatched_rows, distribution))
+}
+
+/// Read the Codex startup-backfill status for a store, if present.
+///
+/// Codex 26.609+ rebuilds the `state_5.sqlite` index from rollout files on
+/// startup and records progress in a `backfill_state` table. Returns `Ok(None)`
+/// when the table is absent (older Codex, or a DB that has never backfilled) so
+/// callers can treat "no backfill machinery" and "complete" distinctly. Opens
+/// read-only to avoid contending with an in-progress rebuild.
+pub(crate) fn read_backfill_status(sqlite_path: &Path) -> Result<Option<String>> {
+    if !sqlite_path.exists() {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        sqlite_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
+    connection.busy_timeout(Duration::from_millis(2_000))?;
+    let has_table: Option<i64> = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backfill_state'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if has_table.is_none() {
+        return Ok(None);
+    }
+    let status: Option<String> = connection
+        .query_row(
+            "SELECT status FROM backfill_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(status)
 }
 
 pub(crate) fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> Result<(u64, u64)> {

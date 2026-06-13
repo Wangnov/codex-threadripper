@@ -12,6 +12,7 @@ mod output;
 mod rollout;
 mod service;
 mod state_db;
+mod stores;
 mod sync;
 #[cfg(test)]
 mod tests;

@@ -36,29 +36,39 @@ pub(crate) fn print_status(locale: Locale, summary: &StatusSummary) {
     );
     println!(
         "{}: {}",
-        status_sqlite_file_label(locale),
-        summary.sqlite_path.display()
-    );
-    println!(
-        "{}: {}",
         status_target_provider_label(locale),
         summary.provider
     );
-    println!(
-        "{}: {}",
-        status_total_threads_label(locale),
-        summary.total_rows
-    );
-    println!(
-        "{}: {}",
-        status_rows_needing_reconcile_label(locale),
-        summary.mismatched_rows
-    );
     println!();
-    println!("{}", status_distribution_heading(locale));
-    for (provider, count) in &summary.distribution {
-        println!("  {provider}: {count}");
+    println!("{}", status_stores_heading(locale));
+    for store in &summary.stores {
+        println!();
+        println!("  [{}] {}", store.kind.slug(), store.kind.label(locale));
+        println!(
+            "    {}: {}",
+            status_sqlite_file_label(locale),
+            store.db_path.display()
+        );
+        println!(
+            "    {}: {}",
+            status_total_threads_label(locale),
+            store.total_rows
+        );
+        println!(
+            "    {}: {}",
+            status_rows_needing_reconcile_label(locale),
+            store.mismatched_rows
+        );
+        if let Some(backfill) = &store.backfill_status {
+            println!("    {}: {}", status_backfill_label(locale), backfill);
+        }
+        println!("    {}", status_distribution_heading(locale));
+        for (provider, count) in &store.distribution {
+            println!("      {provider}: {count}");
+        }
     }
+    println!();
+    println!("{}", status_split_note(locale));
     println!();
     println!("{}", status_background_service_heading(locale));
     println!(
@@ -786,6 +796,31 @@ pub(crate) fn status_distribution_heading(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Provider distribution:",
         Locale::ZhHans => "Provider 分布：",
+    }
+}
+
+pub(crate) fn status_stores_heading(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Storage surfaces:",
+        Locale::ZhHans => "存储面：",
+    }
+}
+
+pub(crate) fn status_backfill_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Rebuild (backfill) status",
+        Locale::ZhHans => "重建（backfill）状态",
+    }
+}
+
+pub(crate) fn status_split_note(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => {
+            "Note: threadripper normalizes the provider within each store; it does not merge CLI and App histories across stores."
+        }
+        Locale::ZhHans => {
+            "说明：threadripper 只在每个库内部归一 provider，不会跨库合并 CLI 与 App 的历史。"
+        }
     }
 }
 

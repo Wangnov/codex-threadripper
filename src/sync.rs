@@ -8,6 +8,7 @@ use crate::cli::DEFAULT_BUCKET_PADDING_BYTES;
 use crate::codex_config::read_provider_from_config;
 use crate::codex_config::resolve_sqlite_path;
 use crate::fs_sync::with_threadripper_lock;
+use crate::locale::detect_locale;
 use crate::rollout::RolloutProgressConfig;
 use crate::rollout::RolloutReconcileSummary;
 use crate::rollout::RolloutScope;
@@ -17,7 +18,11 @@ use crate::service::ServiceStatus as BackgroundServiceStatus;
 use crate::state_db::ProviderDistribution;
 use crate::state_db::create_sqlite_backup_file;
 use crate::state_db::inspect_sqlite_distribution;
+use crate::state_db::read_backfill_status;
 use crate::state_db::reconcile_sqlite_in_place;
+use crate::stores::StoreKind;
+use crate::stores::discover_stores;
+use crate::stores::no_store_found_message;
 
 #[derive(Debug)]
 pub(crate) struct ReconcileSummary {
@@ -33,15 +38,23 @@ pub(crate) struct ReconcileSummary {
     pub(crate) rollout_journal_path: Option<PathBuf>,
 }
 
+/// Per-store status for a single discovered `state_5.sqlite` surface.
 #[derive(Debug)]
-pub(crate) struct StatusSummary {
-    pub(crate) codex_home: PathBuf,
-    pub(crate) sqlite_path: PathBuf,
-    pub(crate) config_path: PathBuf,
-    pub(crate) provider: String,
+pub(crate) struct StoreStatus {
+    pub(crate) kind: StoreKind,
+    pub(crate) db_path: PathBuf,
     pub(crate) total_rows: u64,
     pub(crate) mismatched_rows: u64,
     pub(crate) distribution: ProviderDistribution,
+    pub(crate) backfill_status: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StatusSummary {
+    pub(crate) codex_home: PathBuf,
+    pub(crate) config_path: PathBuf,
+    pub(crate) provider: String,
+    pub(crate) stores: Vec<StoreStatus>,
     pub(crate) service_status: BackgroundServiceStatus,
 }
 
@@ -51,23 +64,40 @@ pub(crate) fn collect_status(
     profile_override: Option<&str>,
 ) -> Result<StatusSummary> {
     let config_path = codex_home.join("config.toml");
-    let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
     let provider = match provider_override {
         Some(provider) => provider.to_string(),
         None => read_provider_from_config(codex_home, profile_override)?,
     };
-    let (total_rows, mismatched_rows, distribution) =
-        inspect_sqlite_distribution(&sqlite_path, provider.as_str())?;
+
+    let targets = discover_stores(codex_home, profile_override)?;
+    if targets.is_empty() {
+        anyhow::bail!(no_store_found_message(detect_locale(), codex_home));
+    }
+    let mut stores = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (total_rows, mismatched_rows, distribution) =
+            inspect_sqlite_distribution(&target.db_path, provider.as_str())?;
+        // Best-effort: backfill status is auxiliary display info, so a read
+        // failure (e.g. a read-only or transiently locked DB during an
+        // in-progress rebuild) must not abort the whole status command.
+        let backfill_status = read_backfill_status(&target.db_path).ok().flatten();
+        stores.push(StoreStatus {
+            kind: target.kind,
+            db_path: target.db_path,
+            total_rows,
+            mismatched_rows,
+            distribution,
+            backfill_status,
+        });
+    }
+
     let service_status = service::current_service_status()?;
 
     Ok(StatusSummary {
         codex_home: codex_home.to_path_buf(),
-        sqlite_path,
         config_path,
         provider,
-        total_rows,
-        mismatched_rows,
-        distribution,
+        stores,
         service_status,
     })
 }

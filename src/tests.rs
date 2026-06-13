@@ -20,6 +20,8 @@ use crate::service::ServiceManager;
 use crate::state_db::inspect_sqlite_distribution;
 use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::reconcile_sqlite_with_backup;
+use crate::stores::StoreKind;
+use crate::stores::discover_stores_with;
 use crate::sync::reconcile_once;
 use crate::watch::WATCH_FULL_ROLLOUT_POLL_INTERVALS;
 use crate::watch::full_watch_rollout_scope;
@@ -292,6 +294,130 @@ fn resolves_sqlite_home_env_after_config() -> Result<()> {
 }
 
 #[test]
+fn discover_returns_cli_default_when_only_top_level_present() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::write(home.join("state_5.sqlite"), b"")?;
+
+    let stores = discover_stores_with(home, None);
+
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].kind, StoreKind::Cli);
+    Ok(())
+}
+
+#[test]
+fn discover_returns_app_when_only_subdir_present() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::create_dir_all(home.join("sqlite"))?;
+    fs::write(home.join("sqlite").join("state_5.sqlite"), b"")?;
+
+    let stores = discover_stores_with(home, None);
+
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].kind, StoreKind::App);
+    Ok(())
+}
+
+#[test]
+fn discover_returns_app_and_cli_when_split() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::write(home.join("state_5.sqlite"), b"")?;
+    fs::create_dir_all(home.join("sqlite"))?;
+    fs::write(home.join("sqlite").join("state_5.sqlite"), b"")?;
+
+    let stores = discover_stores_with(home, None);
+
+    let kinds: Vec<StoreKind> = stores.iter().map(|store| store.kind).collect();
+    assert_eq!(kinds, vec![StoreKind::App, StoreKind::Cli]);
+    Ok(())
+}
+
+#[test]
+fn discover_dedupes_configured_pointing_at_cli_default() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::write(home.join("state_5.sqlite"), b"")?;
+
+    // Configured sqlite_home == codex_home resolves to the same file as the CLI
+    // default; the canonical de-dupe must keep a single entry (Configured wins).
+    let stores = discover_stores_with(home, Some(home));
+
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].kind, StoreKind::Configured);
+    Ok(())
+}
+
+#[test]
+fn discover_returns_empty_when_no_db_present() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stores = discover_stores_with(dir.path(), None);
+    assert!(stores.is_empty());
+}
+
+#[test]
+fn discover_dedupes_configured_pointing_at_app_default() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::create_dir_all(home.join("sqlite"))?;
+    fs::write(home.join("sqlite").join("state_5.sqlite"), b"")?;
+
+    // Configured sqlite_home == <home>/sqlite resolves to the App default file;
+    // Configured must win the label over App after the canonical de-dupe.
+    let stores = discover_stores_with(home, Some(home.join("sqlite").as_path()));
+
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].kind, StoreKind::Configured);
+    Ok(())
+}
+
+#[test]
+fn discover_orders_configured_app_cli_when_all_distinct() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::write(home.join("state_5.sqlite"), b"")?;
+    fs::create_dir_all(home.join("sqlite"))?;
+    fs::write(home.join("sqlite").join("state_5.sqlite"), b"")?;
+    let configured = home.join("custom");
+    fs::create_dir_all(&configured)?;
+    fs::write(configured.join("state_5.sqlite"), b"")?;
+
+    let stores = discover_stores_with(home, Some(configured.as_path()));
+
+    let kinds: Vec<StoreKind> = stores.iter().map(|store| store.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![StoreKind::Configured, StoreKind::App, StoreKind::Cli]
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn discover_dedupes_symlinked_app_to_cli_default() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    fs::write(home.join("state_5.sqlite"), b"")?;
+    fs::create_dir_all(home.join("sqlite"))?;
+    // The App path is a symlink to the CLI default file: the same physical DB.
+    std::os::unix::fs::symlink(
+        home.join("state_5.sqlite"),
+        home.join("sqlite").join("state_5.sqlite"),
+    )?;
+
+    let stores = discover_stores_with(home, None);
+
+    // Canonical de-dupe must collapse to a single store (the App candidate is
+    // checked before Cli and wins), so PR2's write path never touches the same
+    // physical file twice.
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].kind, StoreKind::App);
+    Ok(())
+}
+
+#[test]
 fn rejects_blank_provider_override() {
     let err = validate_provider_override(Locale::En, Some("   ")).unwrap_err();
     assert!(err.to_string().contains("provider must contain"));
@@ -435,6 +561,8 @@ fn seed_sqlite_fixture_includes_current_codex_thread_columns() -> Result<()> {
         "idx_threads_updated_at_ms",
         "idx_threads_archived_cwd_created_at_ms",
         "idx_threads_archived_cwd_updated_at_ms",
+        "idx_threads_visible_created_at_ms",
+        "idx_threads_visible_updated_at_ms",
     ] {
         assert!(indexes.iter().any(|candidate| candidate == index));
     }
@@ -828,6 +956,12 @@ fn seed_sqlite(path: &Path) -> Result<()> {
                 ON threads(archived, cwd, created_at_ms DESC, id DESC);
             CREATE INDEX idx_threads_archived_cwd_updated_at_ms
                 ON threads(archived, cwd, updated_at_ms DESC, id DESC);
+            CREATE INDEX idx_threads_visible_created_at_ms
+                ON threads(archived, created_at_ms DESC)
+                WHERE preview <> '';
+            CREATE INDEX idx_threads_visible_updated_at_ms
+                ON threads(archived, updated_at_ms DESC)
+                WHERE preview <> '';
             CREATE TRIGGER threads_created_at_ms_after_insert
             AFTER INSERT ON threads
             WHEN NEW.created_at_ms IS NULL
