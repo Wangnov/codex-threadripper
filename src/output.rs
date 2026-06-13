@@ -9,7 +9,6 @@ use crate::service::ServiceInstallSummary;
 use crate::service::ServiceManager;
 use crate::sync::MultiReconcileSummary;
 use crate::sync::ReconcileStatus;
-use crate::sync::ReconcileSummary;
 use crate::sync::StatusSummary;
 use crate::sync::StoreOutcome;
 
@@ -125,66 +124,6 @@ pub(crate) fn rollout_progress_message(
             "rollout 进度: 已扫描 {visited_files}/{total_files}，已检查 {checked_files}，已更新 {changed_files}，已准备 {prepared_files}，已跳过 {skipped_files}，耗时 {} ms",
             elapsed.as_millis()
         ),
-    }
-}
-
-pub(crate) fn print_sync_summary(locale: Locale, title: &str, summary: &ReconcileSummary) {
-    println!("{title}");
-    println!(
-        "{}: {}",
-        status_target_provider_label(locale),
-        summary.provider
-    );
-    println!(
-        "{}: {}",
-        sync_rows_updated_label(locale),
-        summary.changed_rows
-    );
-    if summary.checked_rollouts > 0 || summary.changed_rollouts > 0 {
-        println!(
-            "{}: {}",
-            sync_rollouts_checked_label(locale),
-            summary.checked_rollouts
-        );
-        println!(
-            "{}: {}",
-            sync_rollouts_updated_label(locale),
-            summary.changed_rollouts
-        );
-        if summary.prepared_rollouts > 0 {
-            println!(
-                "{}: {}",
-                sync_rollouts_prepared_label(locale),
-                summary.prepared_rollouts
-            );
-        }
-        if summary.skipped_rollouts > 0 {
-            println!(
-                "{}: {}",
-                sync_rollouts_skipped_label(locale),
-                summary.skipped_rollouts
-            );
-        }
-    }
-    println!(
-        "{}: {}",
-        status_total_threads_label(locale),
-        summary.total_rows
-    );
-    println!(
-        "{}: {} ms",
-        sync_elapsed_label(locale),
-        summary.elapsed.as_millis()
-    );
-    if let Some(backup_path) = &summary.backup_path {
-        println!("{}: {}", sync_backup_label(locale), backup_path.display());
-    }
-    if let Some(journal_path) = &summary.rollout_journal_path {
-        println!(
-            "{}: {}",
-            sync_rollout_journal_label(locale),
-            journal_path.display()
-        );
     }
 }
 

@@ -23,14 +23,17 @@ use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::reconcile_sqlite_with_backup;
 use crate::stores::StoreKind;
 use crate::stores::discover_stores_with;
+use crate::sync::MultiReconcileSummary;
 use crate::sync::ReconcileStatus;
 use crate::sync::StoreOutcome;
+use crate::sync::StoreReconcileResult;
 use crate::sync::collect_status;
+use crate::sync::reconcile_all_stores;
 use crate::sync::reconcile_all_stores_with_backup;
-use crate::sync::reconcile_once;
 use crate::watch::WATCH_FULL_ROLLOUT_POLL_INTERVALS;
 use crate::watch::full_watch_rollout_scope;
 use crate::watch::periodic_watch_rollout_scope;
+use crate::watch::watch_should_print_summary;
 use crate::watch::watched_config_paths;
 use anyhow::Result;
 use clap::FromArgMatches;
@@ -42,6 +45,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 #[test]
 fn parses_supported_locale_tags() {
@@ -881,6 +885,7 @@ fn reconcile_all_stores_treats_locked_backfill_status_as_busy() -> Result<()> {
     let lock = Connection::open(&cli_db)?;
     lock.execute_batch("BEGIN EXCLUSIVE;")?;
 
+    let started = Instant::now();
     let summary = reconcile_all_stores_with_backup(
         codex_home,
         Some("openai"),
@@ -890,9 +895,11 @@ fn reconcile_all_stores_treats_locked_backfill_status_as_busy() -> Result<()> {
         Duration::from_millis(0),
         None,
     )?;
+    let elapsed = started.elapsed();
     lock.execute_batch("ROLLBACK;")?;
     drop(lock);
 
+    assert!(elapsed < Duration::from_millis(500));
     assert_eq!(summary.status(), ReconcileStatus::Failed);
     assert!(matches!(summary.stores[0].outcome, StoreOutcome::Skipped));
     assert_eq!(provider_of(&cli_db)?, "cong");
@@ -981,6 +988,56 @@ fn reconcile_all_stores_treats_complete_backfill_as_ready() -> Result<()> {
 }
 
 #[test]
+fn reconcile_all_stores_writes_no_journal_without_backup() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    let rollout_path = codex_home.join("sessions/2026/05/07/rollout-1.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}        \n",
+    )?;
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "cong")?;
+    {
+        let connection = Connection::open(&cli_db)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1 WHERE id = '1'",
+            [rollout_path.display().to_string()],
+        )?;
+    }
+
+    // The no-backup path (watch) rewrites the rollout but must not write a
+    // backups/rollouts.*.jsonl change journal, matching the old watch behaviour.
+    let summary = reconcile_all_stores(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        Duration::from_millis(0),
+        None,
+    )?;
+
+    assert_eq!(summary.changed_rollouts, 1);
+    assert!(fs::read_to_string(&rollout_path)?.contains("\"model_provider\":\"openai\""));
+    assert!(summary.rollout_journal_path.is_none());
+
+    let backups_dir = codex_home.join("backups");
+    let journal_count = if backups_dir.exists() {
+        fs::read_dir(&backups_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("rollouts."))
+            .count()
+    } else {
+        0
+    };
+    assert_eq!(journal_count, 0);
+    Ok(())
+}
+
+#[test]
 fn rejects_blank_provider_override() {
     let err = validate_provider_override(Locale::En, Some("   ")).unwrap_err();
     assert!(err.to_string().contains("provider must contain"));
@@ -1023,18 +1080,35 @@ fn rejects_path_profile_override_in_cli_args_before_help_short_circuit() {
 }
 
 #[test]
-fn reconcile_once_returns_error_when_db_missing() -> Result<()> {
+fn reconcile_all_stores_reports_missing_configured_store_as_failed() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let sqlite_path = dir.path().join("state_5.sqlite");
     fs::write(
         dir.path().join("config.toml"),
-        sqlite_home_config(dir.path()),
+        "model_provider = \"openai\"\nsqlite_home = \".threadripper-test-missing\"\n",
     )?;
 
-    let err = reconcile_once(dir.path(), Some("openai"), None, RolloutScope::None).unwrap_err();
+    let summary = reconcile_all_stores(
+        dir.path(),
+        Some("openai"),
+        None,
+        RolloutScope::None,
+        Duration::from_millis(0),
+        None,
+    )?;
 
-    assert!(err.to_string().contains(&sqlite_path.display().to_string()));
-    assert!(!sqlite_path.exists());
+    assert_eq!(summary.status(), ReconcileStatus::Failed);
+    assert_eq!(summary.stores.len(), 1);
+    assert_eq!(summary.stores[0].kind, StoreKind::Configured);
+    assert!(matches!(
+        summary.stores[0].outcome,
+        StoreOutcome::Failed { .. }
+    ));
+    assert!(
+        !dir.path()
+            .join(".threadripper-test-missing")
+            .join("state_5.sqlite")
+            .exists()
+    );
     Ok(())
 }
 
@@ -1355,17 +1429,78 @@ fn mismatched_scope_followup_repairs_matching_sqlite_rollout_after_sqlite_change
     connection.execute("UPDATE threads SET rollout_path = '' WHERE id = '3'", [])?;
     drop(connection);
 
-    let summary = reconcile_once(
+    let summary = reconcile_all_stores(
         codex_home,
         Some("openai"),
         None,
         RolloutScope::MismatchedRows,
+        Duration::from_millis(0),
+        None,
     )?;
 
-    assert_eq!(summary.changed_rows, 1);
+    assert_eq!(summary.total_changed_rows(), 1);
     assert_eq!(summary.changed_rollouts, 2);
     assert!(fs::read_to_string(&rollout_a)?.contains("\"model_provider\":\"openai\""));
     assert!(fs::read_to_string(&rollout_b)?.contains("\"model_provider\":\"openai\""));
+    Ok(())
+}
+
+#[test]
+fn mismatched_scope_followup_excludes_failed_stores() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    let rollout_cli = codex_home.join("sessions/2026/05/07/rollout-cli.jsonl");
+    let rollout_app = codex_home.join("sessions/2026/05/07/rollout-app.jsonl");
+    fs::create_dir_all(rollout_cli.parent().unwrap())?;
+    fs::write(
+        &rollout_cli,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"vm\"}}       \n",
+    )?;
+    fs::write(
+        &rollout_app,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"app\",\"model_provider\":\"cong\"}}       \n",
+    )?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_store_with_provider(&cli_db, "vm")?;
+    {
+        let connection = Connection::open(&cli_db)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1 WHERE id = '1'",
+            [rollout_cli.display().to_string()],
+        )?;
+    }
+
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    {
+        let connection = Connection::open(&app_db)?;
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO threads (id, rollout_path) VALUES ('app', ?1)",
+            [rollout_app.display().to_string()],
+        )?;
+    }
+
+    let summary = reconcile_all_stores(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::MismatchedRows,
+        Duration::from_millis(0),
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Partial);
+    assert_eq!(summary.total_changed_rows(), 2);
+    assert!(fs::read_to_string(&rollout_cli)?.contains("\"model_provider\":\"openai\""));
+    assert!(fs::read_to_string(&rollout_app)?.contains("\"model_provider\":\"cong\""));
+    assert!(!fs::read_to_string(&rollout_app)?.contains("openai"));
     Ok(())
 }
 
@@ -1416,6 +1551,28 @@ fn watch_periodically_runs_full_rollout_scan() {
         periodic_watch_rollout_scope(RolloutScope::None, WATCH_FULL_ROLLOUT_POLL_INTERVALS),
         RolloutScope::None
     );
+}
+
+#[test]
+fn watch_prints_non_full_summary_even_when_counts_are_unchanged() {
+    let summary = MultiReconcileSummary {
+        provider: "openai".to_string(),
+        stores: vec![StoreReconcileResult {
+            kind: StoreKind::Cli,
+            db_path: PathBuf::from("/tmp/state_5.sqlite"),
+            outcome: StoreOutcome::Failed {
+                error: "missing store".to_string(),
+            },
+        }],
+        changed_rollouts: 0,
+        checked_rollouts: 0,
+        prepared_rollouts: 0,
+        skipped_rollouts: 0,
+        rollout_journal_path: None,
+        elapsed: Duration::ZERO,
+    };
+
+    assert!(watch_should_print_summary(Some("openai"), &summary));
 }
 
 #[test]

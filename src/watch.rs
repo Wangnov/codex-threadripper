@@ -20,7 +20,7 @@ use crate::codex_config::selected_profile_config_path;
 use crate::locale::Locale;
 use crate::output::background_reconcile_title;
 use crate::output::config_change_title;
-use crate::output::print_sync_summary;
+use crate::output::print_multi_sync_summary;
 use crate::output::watch_already_running_error;
 use crate::output::watch_initial_reconcile_error_message;
 use crate::output::watch_reconcile_skipped_message;
@@ -30,7 +30,9 @@ use crate::output::watch_stopped_message;
 use crate::output::watcher_disconnected_error;
 use crate::output::watcher_error_message;
 use crate::rollout::RolloutScope;
-use crate::sync::reconcile_once;
+use crate::sync::MultiReconcileSummary;
+use crate::sync::ReconcileStatus;
+use crate::sync::reconcile_all_stores;
 
 pub(crate) const WATCH_FULL_ROLLOUT_POLL_INTERVALS: u64 = 120;
 
@@ -81,14 +83,16 @@ pub(crate) fn run_watch(
     }
 
     let mut last_provider = None;
-    match reconcile_once(
+    match reconcile_all_stores(
         codex_home,
         provider_override.as_deref(),
         profile_override.as_deref(),
         full_rollout_scope,
+        Duration::ZERO,
+        None,
     ) {
         Ok(summary) => {
-            print_sync_summary(locale, watch_started_title(locale), &summary);
+            print_multi_sync_summary(locale, watch_started_title(locale), &summary);
             last_provider = Some(summary.provider.clone());
         }
         Err(err) => {
@@ -108,18 +112,21 @@ pub(crate) fn run_watch(
         match rx.recv_timeout(timeout) {
             Ok(Ok(event)) => {
                 if touches_config_file(&event, watched_paths.as_slice()) {
-                    match reconcile_once(
+                    match reconcile_all_stores(
                         codex_home,
                         provider_override.as_deref(),
                         profile_override.as_deref(),
                         full_rollout_scope,
+                        Duration::ZERO,
+                        None,
                     ) {
                         Ok(summary) => {
-                            if last_provider.as_deref() != Some(summary.provider.as_str())
-                                || summary.changed_rows > 0
-                                || summary.changed_rollouts > 0
-                            {
-                                print_sync_summary(locale, config_change_title(locale), &summary);
+                            if watch_should_print_summary(last_provider.as_deref(), &summary) {
+                                print_multi_sync_summary(
+                                    locale,
+                                    config_change_title(locale),
+                                    &summary,
+                                );
                             }
                             last_provider = Some(summary.provider.clone());
                             watched_paths =
@@ -137,18 +144,17 @@ pub(crate) fn run_watch(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 poll_count = poll_count.wrapping_add(1);
-                match reconcile_once(
+                match reconcile_all_stores(
                     codex_home,
                     provider_override.as_deref(),
                     profile_override.as_deref(),
                     periodic_watch_rollout_scope(rollout_scope, poll_count),
+                    Duration::ZERO,
+                    None,
                 ) {
                     Ok(summary) => {
-                        if last_provider.as_deref() != Some(summary.provider.as_str())
-                            || summary.changed_rows > 0
-                            || summary.changed_rollouts > 0
-                        {
-                            print_sync_summary(
+                        if watch_should_print_summary(last_provider.as_deref(), &summary) {
+                            print_multi_sync_summary(
                                 locale,
                                 background_reconcile_title(locale),
                                 &summary,
@@ -169,6 +175,16 @@ pub(crate) fn run_watch(
     }
     println!("{}", watch_stopped_message(locale));
     Ok(())
+}
+
+pub(crate) fn watch_should_print_summary(
+    last_provider: Option<&str>,
+    summary: &MultiReconcileSummary,
+) -> bool {
+    summary.status() != ReconcileStatus::Full
+        || last_provider != Some(summary.provider.as_str())
+        || summary.total_changed_rows() > 0
+        || summary.changed_rollouts > 0
 }
 
 pub(crate) fn periodic_watch_rollout_scope(

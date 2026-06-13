@@ -163,6 +163,7 @@ enum RolloutChangeMode {
     InPlace,
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_rollout_metadata_from_sqlite_with_progress(
     sqlite_path: &Path,
     _codex_home: &Path,

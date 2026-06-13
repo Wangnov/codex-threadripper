@@ -11,13 +11,10 @@ use rusqlite::ErrorCode;
 
 use crate::cli::DEFAULT_BUCKET_PADDING_BYTES;
 use crate::codex_config::read_provider_from_config;
-use crate::codex_config::resolve_sqlite_path;
 use crate::fs_sync::with_threadripper_lock;
 use crate::locale::detect_locale;
 use crate::rollout::RolloutProgressConfig;
-use crate::rollout::RolloutReconcileSummary;
 use crate::rollout::RolloutScope;
-use crate::rollout::reconcile_rollout_metadata_from_sqlite_with_progress;
 use crate::rollout::reconcile_rollouts_for_stores;
 use crate::service;
 use crate::service::ServiceStatus as BackgroundServiceStatus;
@@ -25,26 +22,13 @@ use crate::state_db::ProviderDistribution;
 use crate::state_db::create_sqlite_backup_file_in;
 use crate::state_db::inspect_sqlite_distribution;
 use crate::state_db::read_backfill_status;
+use crate::state_db::read_backfill_status_with_timeout;
 use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::unix_timestamp_millis;
 use crate::stores::StoreKind;
 use crate::stores::StoreTarget;
 use crate::stores::discover_stores;
 use crate::stores::no_store_found_message;
-
-#[derive(Debug)]
-pub(crate) struct ReconcileSummary {
-    pub(crate) provider: String,
-    pub(crate) changed_rows: u64,
-    pub(crate) total_rows: u64,
-    pub(crate) changed_rollouts: u64,
-    pub(crate) checked_rollouts: u64,
-    pub(crate) prepared_rollouts: u64,
-    pub(crate) skipped_rollouts: u64,
-    pub(crate) elapsed: Duration,
-    pub(crate) backup_path: Option<PathBuf>,
-    pub(crate) rollout_journal_path: Option<PathBuf>,
-}
 
 /// Per-store status for a single discovered `state_5.sqlite` surface.
 #[derive(Debug)]
@@ -212,6 +196,11 @@ impl MultiReconcileSummary {
                 && (store.kind == StoreKind::App || store.db_path == app_db_path)
         })
     }
+
+    /// Total SQLite rows flipped across all updated stores.
+    pub(crate) fn total_changed_rows(&self) -> u64 {
+        total_changed_rows(&self.stores)
+    }
 }
 
 /// Default bounded wait for an in-progress Codex backfill before a store is
@@ -234,8 +223,9 @@ enum BackfillReadiness {
 /// surfaces any real problem.
 fn wait_for_store_backfill(db_path: &Path, budget: Duration) -> BackfillReadiness {
     let started = Instant::now();
+    let read_timeout = Duration::from_millis(2_000).min(budget);
     loop {
-        match read_backfill_status(db_path) {
+        match read_backfill_status_with_timeout(db_path, read_timeout) {
             Ok(None) => return BackfillReadiness::Ready,
             Ok(Some(status)) if status == "complete" => return BackfillReadiness::Ready,
             Ok(Some(_)) => {}
@@ -273,25 +263,55 @@ pub(crate) fn reconcile_all_stores_with_backup(
     progress: Option<RolloutProgressConfig>,
 ) -> Result<MultiReconcileSummary> {
     with_threadripper_lock(codex_home, || {
-        reconcile_all_stores_with_backup_unlocked(
+        reconcile_stores_core(
             codex_home,
             provider_override,
             profile_override,
             rollout_scope,
             padding_bytes,
             backfill_wait,
+            true,
             progress,
         )
     })
 }
 
-fn reconcile_all_stores_with_backup_unlocked(
+/// Like [`reconcile_all_stores_with_backup`] but without per-store backups: the
+/// continuous `watch` service reconciles every poll, so backing up each store
+/// every time would be wasteful. Supports the incremental `MismatchedRows` scope
+/// (with an `AllRows` rollout followup when rows change), like the former
+/// single-store watch path.
+pub(crate) fn reconcile_all_stores(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
+    rollout_scope: RolloutScope,
+    backfill_wait: Duration,
+    progress: Option<RolloutProgressConfig>,
+) -> Result<MultiReconcileSummary> {
+    with_threadripper_lock(codex_home, || {
+        reconcile_stores_core(
+            codex_home,
+            provider_override,
+            profile_override,
+            rollout_scope,
+            DEFAULT_BUCKET_PADDING_BYTES,
+            backfill_wait,
+            false,
+            progress,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_stores_core(
     codex_home: &Path,
     provider_override: Option<&str>,
     profile_override: Option<&str>,
     rollout_scope: RolloutScope,
     padding_bytes: usize,
     backfill_wait: Duration,
+    backup: bool,
     progress: Option<RolloutProgressConfig>,
 ) -> Result<MultiReconcileSummary> {
     let provider = match provider_override {
@@ -303,15 +323,6 @@ fn reconcile_all_stores_with_backup_unlocked(
         anyhow::bail!(no_store_found_message(detect_locale(), codex_home));
     }
     let started = Instant::now();
-
-    // The multi-store path only supports whole-store scopes. MismatchedRows
-    // relies on the single-store followup pass (see reconcile_once_with_progress)
-    // that this path does not run; `sync` / `bucket switch` only pass AllRows or
-    // None. Guard against a future caller wiring MismatchedRows through here.
-    debug_assert!(
-        rollout_scope != RolloutScope::MismatchedRows,
-        "multi-store reconcile expects AllRows or None"
-    );
 
     // 0) Backfill guard: a store whose Codex startup-backfill is still running
     //    after the bounded wait is skipped entirely — we neither collect its
@@ -358,16 +369,18 @@ fn reconcile_all_stores_with_backup_unlocked(
     //    the whole round so no store is left with rewritten rollouts but an old DB.
     let mut backup_paths: HashMap<PathBuf, PathBuf> = HashMap::new();
     let mut backup_failed: HashMap<PathBuf, String> = HashMap::new();
-    for target in targets
-        .iter()
-        .filter(|target| !busy.contains(&target.db_path))
-    {
-        match create_store_backup(target) {
-            Ok(backup_path) => {
-                backup_paths.insert(target.db_path.clone(), backup_path);
-            }
-            Err(error) => {
-                backup_failed.insert(target.db_path.clone(), error.to_string());
+    if backup {
+        for target in targets
+            .iter()
+            .filter(|target| !busy.contains(&target.db_path))
+        {
+            match create_store_backup(target) {
+                Ok(backup_path) => {
+                    backup_paths.insert(target.db_path.clone(), backup_path);
+                }
+                Err(error) => {
+                    backup_failed.insert(target.db_path.clone(), error.to_string());
+                }
             }
         }
     }
@@ -417,18 +430,27 @@ fn reconcile_all_stores_with_backup_unlocked(
         .filter(|target| !backup_failed.contains_key(&target.db_path))
         .map(|target| target.db_path.clone())
         .collect();
-    let rollout_journal_path = codex_home
-        .join("backups")
-        .join(format!("rollouts.{}.jsonl", unix_timestamp_millis()?));
+    // The rollout change journal is part of the backup story: the one-shot
+    // commands write it next to the per-store backups, but the continuous
+    // `watch` service (backup = false) must not litter `backups/` every poll.
+    let rollout_journal_path = if backup {
+        Some(
+            codex_home
+                .join("backups")
+                .join(format!("rollouts.{}.jsonl", unix_timestamp_millis()?)),
+        )
+    } else {
+        None
+    };
     let rollout_outcome = reconcile_rollouts_for_stores(
         ready_db_paths.as_slice(),
         provider.as_str(),
         rollout_scope,
-        Some(rollout_journal_path.as_path()),
+        rollout_journal_path.as_deref(),
         padding_bytes,
         progress,
     )?;
-    let rollout_summary = rollout_outcome.summary;
+    let mut rollout_summary = rollout_outcome.summary;
     let rollout_failed: HashMap<PathBuf, String> =
         rollout_outcome.failed_stores.into_iter().collect();
 
@@ -462,13 +484,52 @@ fn reconcile_all_stores_with_backup_unlocked(
                     },
                 }
             } else {
-                let backup_path = backup_paths
-                    .remove(&target.db_path)
-                    .expect("backup was prepared for ready store");
+                let backup_path = if backup {
+                    Some(
+                        backup_paths
+                            .remove(&target.db_path)
+                            .expect("backup was prepared for ready store"),
+                    )
+                } else {
+                    None
+                };
                 reconcile_single_store(target, provider.as_str(), backup_path)
             }
         })
         .collect();
+
+    // 3) MismatchedRows is incremental: the first pass only rewrote rollouts for
+    //    rows the DB had marked mismatched. After flipping those rows, run a full
+    //    AllRows rollout pass so any rollout that drifted is corrected too. (busy
+    //    is empty here — the whole-round skip above already returned if a backfill
+    //    was running under a rollout-rewriting scope.)
+    if rollout_scope == RolloutScope::MismatchedRows && total_changed_rows(&stores) > 0 {
+        let followup_db_paths: Vec<PathBuf> = stores
+            .iter()
+            .filter(|store| matches!(store.outcome, StoreOutcome::Updated { .. }))
+            .map(|store| store.db_path.clone())
+            .collect();
+        let followup = reconcile_rollouts_for_stores(
+            followup_db_paths.as_slice(),
+            provider.as_str(),
+            RolloutScope::AllRows,
+            None,
+            padding_bytes,
+            None,
+        )?;
+        // These stores were just read successfully in the primary pass; a
+        // failure here would mean one became unreadable mid-run (rare). The
+        // primary DB + rollout writes are already consistent, so we only skip
+        // the optional drift repair, but flag it in debug builds.
+        debug_assert!(
+            followup.failed_stores.is_empty(),
+            "ready store became unreadable between rollout passes"
+        );
+        rollout_summary.checked_files += followup.summary.checked_files;
+        rollout_summary.changed_files += followup.summary.changed_files;
+        rollout_summary.prepared_files += followup.summary.prepared_files;
+        rollout_summary.skipped_files += followup.summary.skipped_files;
+    }
 
     Ok(MultiReconcileSummary {
         provider,
@@ -492,16 +553,27 @@ fn create_store_backup(target: &StoreTarget) -> Result<PathBuf> {
     create_sqlite_backup_file_in(&target.db_path, &backups_dir)
 }
 
+/// Total `changed_rows` across all updated stores.
+fn total_changed_rows(stores: &[StoreReconcileResult]) -> u64 {
+    stores
+        .iter()
+        .map(|store| match &store.outcome {
+            StoreOutcome::Updated { changed_rows, .. } => *changed_rows,
+            _ => 0,
+        })
+        .sum()
+}
+
 fn reconcile_single_store(
     target: &StoreTarget,
     provider: &str,
-    backup_path: PathBuf,
+    backup_path: Option<PathBuf>,
 ) -> StoreReconcileResult {
     let outcome = match reconcile_single_store_inner(target, provider, backup_path) {
         Ok((changed_rows, total_rows, backup_path)) => StoreOutcome::Updated {
             changed_rows,
             total_rows,
-            backup_path: Some(backup_path),
+            backup_path,
         },
         Err(error) => StoreOutcome::Failed {
             error: error.to_string(),
@@ -517,98 +589,8 @@ fn reconcile_single_store(
 fn reconcile_single_store_inner(
     target: &StoreTarget,
     provider: &str,
-    backup_path: PathBuf,
-) -> Result<(u64, u64, PathBuf)> {
+    backup_path: Option<PathBuf>,
+) -> Result<(u64, u64, Option<PathBuf>)> {
     let (changed_rows, total_rows) = reconcile_sqlite_in_place(&target.db_path, provider)?;
     Ok((changed_rows, total_rows, backup_path))
-}
-
-pub(crate) fn reconcile_once(
-    codex_home: &Path,
-    provider_override: Option<&str>,
-    profile_override: Option<&str>,
-    rollout_scope: RolloutScope,
-) -> Result<ReconcileSummary> {
-    reconcile_once_with_progress(
-        codex_home,
-        provider_override,
-        profile_override,
-        rollout_scope,
-        None,
-    )
-}
-
-fn reconcile_once_with_progress(
-    codex_home: &Path,
-    provider_override: Option<&str>,
-    profile_override: Option<&str>,
-    rollout_scope: RolloutScope,
-    progress: Option<RolloutProgressConfig>,
-) -> Result<ReconcileSummary> {
-    with_threadripper_lock(codex_home, || {
-        reconcile_once_with_progress_unlocked(
-            codex_home,
-            provider_override,
-            profile_override,
-            rollout_scope,
-            progress,
-        )
-    })
-}
-
-fn reconcile_once_with_progress_unlocked(
-    codex_home: &Path,
-    provider_override: Option<&str>,
-    profile_override: Option<&str>,
-    rollout_scope: RolloutScope,
-    progress: Option<RolloutProgressConfig>,
-) -> Result<ReconcileSummary> {
-    let provider = match provider_override {
-        Some(provider) => provider.to_string(),
-        None => read_provider_from_config(codex_home, profile_override)?,
-    };
-    let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
-    let started = Instant::now();
-    let mut rollout_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
-        &sqlite_path,
-        codex_home,
-        provider.as_str(),
-        rollout_scope,
-        None,
-        DEFAULT_BUCKET_PADDING_BYTES,
-        progress,
-    )?;
-    let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
-    if rollout_scope == RolloutScope::MismatchedRows && changed_rows > 0 {
-        let followup_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
-            &sqlite_path,
-            codex_home,
-            provider.as_str(),
-            RolloutScope::AllRows,
-            None,
-            DEFAULT_BUCKET_PADDING_BYTES,
-            None,
-        )?;
-        add_rollout_summary(&mut rollout_summary, followup_summary);
-    }
-
-    Ok(ReconcileSummary {
-        provider,
-        changed_rows,
-        total_rows,
-        changed_rollouts: rollout_summary.changed_files,
-        checked_rollouts: rollout_summary.checked_files,
-        prepared_rollouts: rollout_summary.prepared_files,
-        skipped_rollouts: rollout_summary.skipped_files,
-        elapsed: started.elapsed(),
-        backup_path: None,
-        rollout_journal_path: rollout_summary.journal_path,
-    })
-}
-
-fn add_rollout_summary(summary: &mut RolloutReconcileSummary, extra: RolloutReconcileSummary) {
-    summary.checked_files += extra.checked_files;
-    summary.changed_files += extra.changed_files;
-    summary.prepared_files += extra.prepared_files;
-    summary.skipped_files += extra.skipped_files;
 }

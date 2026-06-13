@@ -52,6 +52,13 @@ pub(crate) fn inspect_sqlite_distribution(
 /// callers can treat "no backfill machinery" and "complete" distinctly. Opens
 /// read-only to avoid contending with an in-progress rebuild.
 pub(crate) fn read_backfill_status(sqlite_path: &Path) -> Result<Option<String>> {
+    read_backfill_status_with_timeout(sqlite_path, Duration::from_millis(2_000))
+}
+
+pub(crate) fn read_backfill_status_with_timeout(
+    sqlite_path: &Path,
+    busy_timeout: Duration,
+) -> Result<Option<String>> {
     if !sqlite_path.exists() {
         return Ok(None);
     }
@@ -60,7 +67,7 @@ pub(crate) fn read_backfill_status(sqlite_path: &Path) -> Result<Option<String>>
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
-    connection.busy_timeout(Duration::from_millis(2_000))?;
+    connection.busy_timeout(busy_timeout)?;
     let has_table: Option<i64> = connection
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backfill_state'",

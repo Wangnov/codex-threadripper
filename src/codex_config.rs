@@ -52,6 +52,10 @@ pub(crate) fn read_provider_from_config(
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()))
 }
 
+// Legacy single-store path resolver. The multi-store path now goes through
+// `discover_stores` / `configured_sqlite_home`; this helper is only kept for the
+// resolution unit tests, so it is gated to test builds to stay clippy-clean.
+#[cfg(test)]
 pub(crate) fn resolve_sqlite_path(
     codex_home: &Path,
     profile_override: Option<&str>,
@@ -188,6 +192,9 @@ fn trimmed_string(value: &str) -> Option<String> {
     }
 }
 
+// Test-only sibling of `configured_sqlite_home_from` that applies the
+// `codex_home` default. Production code uses `configured_sqlite_home`.
+#[cfg(test)]
 pub(crate) fn resolve_sqlite_home_from_config(
     codex_home: &Path,
     config_sqlite_home: Option<&str>,
