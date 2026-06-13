@@ -105,6 +105,19 @@ pub(crate) fn collect_status(
             }
         }
     }
+    if stores.iter().all(|store| store.error.is_some()) {
+        let details = stores
+            .iter()
+            .filter_map(|store| {
+                store
+                    .error
+                    .as_deref()
+                    .map(|error| format!("{}: {error}", store.db_path.display()))
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("failed to inspect any Codex state database: {details}");
+    }
 
     let service_status = service::current_service_status()?;
 

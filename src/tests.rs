@@ -448,6 +448,19 @@ fn status_reports_broken_store_without_hiding_healthy_store() -> Result<()> {
 }
 
 #[test]
+fn status_errors_when_every_store_is_broken() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path();
+    isolate_process_sqlite_home(home)?;
+    fs::write(home.join("state_5.sqlite"), b"not a sqlite database")?;
+
+    let err = collect_status(home, Some("openai"), None).unwrap_err();
+
+    assert!(err.to_string().contains("failed to inspect any"));
+    Ok(())
+}
+
+#[test]
 fn rejects_blank_provider_override() {
     let err = validate_provider_override(Locale::En, Some("   ")).unwrap_err();
     assert!(err.to_string().contains("provider must contain"));
