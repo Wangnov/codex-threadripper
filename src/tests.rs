@@ -15,6 +15,7 @@ use crate::locale::parse_apple_languages;
 use crate::locale::parse_locale_tag;
 use crate::output::install_next_steps;
 use crate::rollout::RolloutScope;
+use crate::rollout::prepare_bucket_padding;
 use crate::rollout::reconcile_rollout_metadata_from_sqlite_with_progress;
 use crate::service::ServiceManager;
 use crate::state_db::inspect_sqlite_distribution;
@@ -22,7 +23,10 @@ use crate::state_db::reconcile_sqlite_in_place;
 use crate::state_db::reconcile_sqlite_with_backup;
 use crate::stores::StoreKind;
 use crate::stores::discover_stores_with;
+use crate::sync::ReconcileStatus;
+use crate::sync::StoreOutcome;
 use crate::sync::collect_status;
+use crate::sync::reconcile_all_stores_with_backup;
 use crate::sync::reconcile_once;
 use crate::watch::WATCH_FULL_ROLLOUT_POLL_INTERVALS;
 use crate::watch::full_watch_rollout_scope;
@@ -479,12 +483,306 @@ fn status_reports_missing_configured_store_alongside_default_store() -> Result<(
 fn status_errors_when_every_store_is_broken() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let home = dir.path();
-    isolate_process_sqlite_home(home)?;
+    fs::write(home.join("config.toml"), sqlite_home_config(home))?;
     fs::write(home.join("state_5.sqlite"), b"not a sqlite database")?;
 
     let err = collect_status(home, Some("openai"), None).unwrap_err();
 
     assert!(err.to_string().contains("failed to inspect any"));
+    Ok(())
+}
+
+#[test]
+fn reconcile_all_stores_updates_every_surface_and_dedupes_rollout() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    // A single rollout JSONL shared by both stores' thread "1".
+    let rollout_path = codex_home.join("sessions/2026/05/07/rollout-1.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}        \n",
+    )?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    for db in [&cli_db, &app_db] {
+        seed_sqlite(db)?;
+        let connection = Connection::open(db)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1, model_provider = 'cong' WHERE id = '1'",
+            [rollout_path.display().to_string()],
+        )?;
+    }
+
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Full);
+    let kinds: Vec<StoreKind> = summary.stores.iter().map(|store| store.kind).collect();
+    assert!(kinds.contains(&StoreKind::App));
+    assert!(kinds.contains(&StoreKind::Cli));
+    for store in &summary.stores {
+        assert!(matches!(store.outcome, StoreOutcome::Updated { .. }));
+    }
+
+    // Both DBs now report the target provider for thread "1".
+    for db in [&cli_db, &app_db] {
+        let connection = Connection::open(db)?;
+        let provider: String = connection.query_row(
+            "SELECT model_provider FROM threads WHERE id = '1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(provider, "openai");
+    }
+
+    // The shared rollout was rewritten exactly once (deduped across stores).
+    assert_eq!(summary.changed_rollouts, 1);
+    let rewritten = fs::read_to_string(&rollout_path)?;
+    assert!(rewritten.contains("\"model_provider\":\"openai\""));
+
+    // Backups are namespaced per store.
+    assert!(codex_home.join("backups/cli").exists());
+    assert!(codex_home.join("sqlite/backups/app").exists());
+    Ok(())
+}
+
+#[test]
+fn reconcile_all_stores_reports_partial_when_a_store_is_unreadable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    // Healthy CLI store with a mismatched provider.
+    let cli_db = codex_home.join("state_5.sqlite");
+    seed_sqlite(&cli_db)?;
+    {
+        let connection = Connection::open(&cli_db)?;
+        connection.execute(
+            "UPDATE threads SET model_provider = 'cong' WHERE id = '1'",
+            [],
+        )?;
+    }
+    // App store exists but is not a valid SQLite database.
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    fs::write(&app_db, b"not a sqlite database")?;
+
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::None,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Partial);
+    let cli = summary
+        .stores
+        .iter()
+        .find(|store| store.kind == StoreKind::Cli)
+        .expect("cli store present");
+    assert!(matches!(cli.outcome, StoreOutcome::Updated { .. }));
+    let app = summary
+        .stores
+        .iter()
+        .find(|store| store.kind == StoreKind::App)
+        .expect("app store present");
+    assert!(matches!(app.outcome, StoreOutcome::Failed { .. }));
+
+    // The healthy store was still updated despite the broken one.
+    let connection = Connection::open(&cli_db)?;
+    let provider: String = connection.query_row(
+        "SELECT model_provider FROM threads WHERE id = '1'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(provider, "openai");
+    Ok(())
+}
+
+#[test]
+fn sqlite_only_warning_detects_configured_app_alias() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    let app_home = codex_home.join("sqlite");
+    fs::create_dir_all(&app_home)?;
+    fs::write(
+        codex_home.join("config.toml"),
+        sqlite_home_config(&app_home),
+    )?;
+    seed_sqlite(&app_home.join("state_5.sqlite"))?;
+
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::None,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Full);
+    assert_eq!(summary.stores.len(), 1);
+    assert_eq!(summary.stores[0].kind, StoreKind::Configured);
+    assert!(summary.touches_app_store(codex_home));
+    Ok(())
+}
+
+#[test]
+fn bucket_prepare_checks_rollouts_from_all_stores() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    fs::write(
+        codex_home.join("config.toml"),
+        sqlite_home_config(codex_home),
+    )?;
+
+    let cli_rollout = codex_home.join("sessions/2026/05/07/rollout-cli.jsonl");
+    let app_rollout = codex_home.join("sessions/2026/05/07/rollout-app.jsonl");
+    fs::create_dir_all(cli_rollout.parent().unwrap())?;
+    fs::write(
+        &cli_rollout,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}\n",
+    )?;
+    fs::write(
+        &app_rollout,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}\n",
+    )?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    for (db, rollout) in [(&cli_db, &cli_rollout), (&app_db, &app_rollout)] {
+        seed_sqlite(db)?;
+        let connection = Connection::open(db)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1 WHERE id = '1'",
+            [rollout.display().to_string()],
+        )?;
+    }
+
+    let summary = prepare_bucket_padding(codex_home, None, DEFAULT_BUCKET_PADDING_BYTES)?;
+
+    assert_eq!(summary.checked_rollouts, 2);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn reconcile_all_stores_skips_rollout_when_store_backup_fails() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+
+    let rollout_path = codex_home.join("sessions/2026/05/07/rollout-1.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"cong\"}}        \n",
+    )?;
+
+    let cli_db = codex_home.join("state_5.sqlite");
+    let app_db = codex_home.join("sqlite").join("state_5.sqlite");
+    fs::create_dir_all(app_db.parent().unwrap())?;
+    for db in [&cli_db, &app_db] {
+        seed_sqlite(db)?;
+        let connection = Connection::open(db)?;
+        connection.execute(
+            "UPDATE threads SET rollout_path = ?1, model_provider = 'cong' WHERE id = '1'",
+            [rollout_path.display().to_string()],
+        )?;
+    }
+
+    let app_dir = app_db.parent().unwrap();
+    let original_mode = fs::metadata(app_dir)?.permissions().mode();
+    fs::set_permissions(app_dir, fs::Permissions::from_mode(0o500))?;
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        None,
+    );
+    fs::set_permissions(app_dir, fs::Permissions::from_mode(original_mode))?;
+    let summary = summary?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Failed);
+    assert_eq!(summary.changed_rollouts, 0);
+    assert!(fs::read_to_string(&rollout_path)?.contains("\"model_provider\":\"cong\""));
+    for db in [&cli_db, &app_db] {
+        let connection = Connection::open(db)?;
+        let provider: String = connection.query_row(
+            "SELECT model_provider FROM threads WHERE id = '1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(provider, "cong");
+    }
+    Ok(())
+}
+
+#[test]
+fn reconcile_all_stores_fails_store_when_rollout_targets_unreadable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    fs::write(
+        codex_home.join("config.toml"),
+        sqlite_home_config(codex_home),
+    )?;
+
+    // A valid SQLite DB whose `threads` table has `model_provider` but no
+    // `rollout_path` column: `UPDATE model_provider` would succeed, yet rollout
+    // target collection fails. The store must be reported Failed (not silently
+    // Updated), and its DB must be left untouched.
+    let cli_db = codex_home.join("state_5.sqlite");
+    {
+        let connection = Connection::open(&cli_db)?;
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO threads (id, model_provider) VALUES ('1', 'cong')",
+            [],
+        )?;
+    }
+
+    let summary = reconcile_all_stores_with_backup(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        DEFAULT_BUCKET_PADDING_BYTES,
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Failed);
+    assert!(matches!(
+        summary.stores[0].outcome,
+        StoreOutcome::Failed { .. }
+    ));
+    let connection = Connection::open(&cli_db)?;
+    let provider: String = connection.query_row(
+        "SELECT model_provider FROM threads WHERE id = '1'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(provider, "cong");
     Ok(())
 }
 
@@ -1097,9 +1395,18 @@ fn sqlite_home_config(path: &Path) -> String {
 }
 
 fn isolate_process_sqlite_home(codex_home: &Path) -> Result<()> {
+    let configured_home = codex_home.join(".threadripper-test-configured");
+    fs::create_dir_all(&configured_home)?;
+    let configured_db = configured_home.join("state_5.sqlite");
+    seed_sqlite(&configured_db)?;
+    let connection = Connection::open(&configured_db)?;
+    connection.execute(
+        "UPDATE threads SET model_provider = 'openai', rollout_path = ''",
+        [],
+    )?;
     fs::write(
         codex_home.join("config.toml"),
-        "model_provider = \"openai\"\nsqlite_home = \".threadripper-test-missing\"\n",
+        "model_provider = \"openai\"\nsqlite_home = \".threadripper-test-configured\"\n",
     )?;
     Ok(())
 }

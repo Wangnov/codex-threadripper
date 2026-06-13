@@ -103,17 +103,23 @@ pub(crate) fn reconcile_sqlite_with_backup(
     sqlite_path: &Path,
     provider: &str,
 ) -> Result<(u64, u64, PathBuf)> {
-    let backup_path = create_sqlite_backup_file(sqlite_path)?;
-    let (changed_rows, total_rows) = reconcile_sqlite_in_place(sqlite_path, provider)?;
-    Ok((changed_rows, total_rows, backup_path))
-}
-
-pub(crate) fn create_sqlite_backup_file(sqlite_path: &Path) -> Result<PathBuf> {
     let backups_dir = sqlite_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("backups");
-    fs::create_dir_all(&backups_dir)
+    let backup_path = create_sqlite_backup_file_in(sqlite_path, &backups_dir)?;
+    let (changed_rows, total_rows) = reconcile_sqlite_in_place(sqlite_path, provider)?;
+    Ok((changed_rows, total_rows, backup_path))
+}
+
+/// Back up `sqlite_path` into an explicit `backups_dir`. Multi-store sync uses
+/// this with a per-store namespaced directory (`<db_parent>/backups/<store>/`)
+/// so concurrent surfaces never clobber each other's backups.
+pub(crate) fn create_sqlite_backup_file_in(
+    sqlite_path: &Path,
+    backups_dir: &Path,
+) -> Result<PathBuf> {
+    fs::create_dir_all(backups_dir)
         .with_context(|| format!("failed to create {}", backups_dir.display()))?;
 
     let timestamp = unix_timestamp_millis()?;
@@ -133,7 +139,7 @@ pub(crate) fn create_sqlite_backup_file(sqlite_path: &Path) -> Result<PathBuf> {
     create_sqlite_backup(sqlite_path, &backup_temp_path)?;
     fs::rename(&backup_temp_path, &backup_path)
         .with_context(|| format!("failed to finalize {}", backup_path.display()))?;
-    sync_dir(&backups_dir)?;
+    sync_dir(backups_dir)?;
 
     Ok(backup_path)
 }

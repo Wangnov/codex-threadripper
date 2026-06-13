@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,14 +14,17 @@ use crate::rollout::RolloutProgressConfig;
 use crate::rollout::RolloutReconcileSummary;
 use crate::rollout::RolloutScope;
 use crate::rollout::reconcile_rollout_metadata_from_sqlite_with_progress;
+use crate::rollout::reconcile_rollouts_for_stores;
 use crate::service;
 use crate::service::ServiceStatus as BackgroundServiceStatus;
 use crate::state_db::ProviderDistribution;
-use crate::state_db::create_sqlite_backup_file;
+use crate::state_db::create_sqlite_backup_file_in;
 use crate::state_db::inspect_sqlite_distribution;
 use crate::state_db::read_backfill_status;
 use crate::state_db::reconcile_sqlite_in_place;
+use crate::state_db::unix_timestamp_millis;
 use crate::stores::StoreKind;
+use crate::stores::StoreTarget;
 use crate::stores::discover_stores;
 use crate::stores::no_store_found_message;
 
@@ -130,6 +134,280 @@ pub(crate) fn collect_status(
     })
 }
 
+/// Status of a multi-store reconcile run, mapped to a process exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileStatus {
+    /// Every selected store was updated. Exit code 0.
+    Full,
+    /// Some stores were updated and at least one failed. Exit code 2.
+    Partial,
+    /// No store could be updated. Exit code 1.
+    Failed,
+}
+
+#[derive(Debug)]
+pub(crate) enum StoreOutcome {
+    Updated {
+        changed_rows: u64,
+        total_rows: u64,
+        backup_path: Option<PathBuf>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct StoreReconcileResult {
+    pub(crate) kind: StoreKind,
+    pub(crate) db_path: PathBuf,
+    pub(crate) outcome: StoreOutcome,
+}
+
+#[derive(Debug)]
+pub(crate) struct MultiReconcileSummary {
+    pub(crate) provider: String,
+    pub(crate) stores: Vec<StoreReconcileResult>,
+    pub(crate) changed_rollouts: u64,
+    pub(crate) checked_rollouts: u64,
+    pub(crate) prepared_rollouts: u64,
+    pub(crate) skipped_rollouts: u64,
+    pub(crate) rollout_journal_path: Option<PathBuf>,
+    pub(crate) elapsed: Duration,
+}
+
+impl MultiReconcileSummary {
+    pub(crate) fn status(&self) -> ReconcileStatus {
+        let updated = self
+            .stores
+            .iter()
+            .filter(|store| matches!(store.outcome, StoreOutcome::Updated { .. }))
+            .count();
+        if updated == self.stores.len() {
+            ReconcileStatus::Full
+        } else if updated == 0 {
+            ReconcileStatus::Failed
+        } else {
+            ReconcileStatus::Partial
+        }
+    }
+
+    /// True when any selected store is the Codex App surface — used to warn that
+    /// `--sqlite-only` edits there may be reverted by Codex's rollout backfill.
+    pub(crate) fn touches_app_store(&self, codex_home: &Path) -> bool {
+        let app_db_path = codex_home
+            .join(crate::stores::APP_SQLITE_SUBDIR)
+            .join(crate::codex_config::STATE_DB_FILENAME);
+        let app_db_path = app_db_path.canonicalize().unwrap_or(app_db_path);
+        self.stores
+            .iter()
+            .any(|store| store.kind == StoreKind::App || store.db_path == app_db_path)
+    }
+}
+
+/// Reconcile the provider across **all** discovered stores plus the shared
+/// rollout JSONL, backing up each store first. This is the multi-store write
+/// path for the one-shot `sync` / `bucket switch` commands.
+pub(crate) fn reconcile_all_stores_with_backup(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
+    rollout_scope: RolloutScope,
+    padding_bytes: usize,
+    progress: Option<RolloutProgressConfig>,
+) -> Result<MultiReconcileSummary> {
+    with_threadripper_lock(codex_home, || {
+        reconcile_all_stores_with_backup_unlocked(
+            codex_home,
+            provider_override,
+            profile_override,
+            rollout_scope,
+            padding_bytes,
+            progress,
+        )
+    })
+}
+
+fn reconcile_all_stores_with_backup_unlocked(
+    codex_home: &Path,
+    provider_override: Option<&str>,
+    profile_override: Option<&str>,
+    rollout_scope: RolloutScope,
+    padding_bytes: usize,
+    progress: Option<RolloutProgressConfig>,
+) -> Result<MultiReconcileSummary> {
+    let provider = match provider_override {
+        Some(provider) => provider.to_string(),
+        None => read_provider_from_config(codex_home, profile_override)?,
+    };
+    let targets = discover_stores(codex_home, profile_override)?;
+    if targets.is_empty() {
+        anyhow::bail!(no_store_found_message(detect_locale(), codex_home));
+    }
+    let started = Instant::now();
+
+    // The multi-store path only supports whole-store scopes. MismatchedRows
+    // relies on the single-store followup pass (see reconcile_once_with_progress)
+    // that this path does not run; `sync` / `bucket switch` only pass AllRows or
+    // None. Guard against a future caller wiring MismatchedRows through here.
+    debug_assert!(
+        rollout_scope != RolloutScope::MismatchedRows,
+        "multi-store reconcile expects AllRows or None"
+    );
+
+    // 1) Take every per-store backup before touching shared rollout JSONL. If a
+    //    rollout-writing command cannot back up one selected store, skip the
+    //    whole round so no store is left with rewritten rollouts but an old DB.
+    let mut backup_paths: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut backup_failed: HashMap<PathBuf, String> = HashMap::new();
+    for target in &targets {
+        match create_store_backup(target) {
+            Ok(backup_path) => {
+                backup_paths.insert(target.db_path.clone(), backup_path);
+            }
+            Err(error) => {
+                backup_failed.insert(target.db_path.clone(), error.to_string());
+            }
+        }
+    }
+    if rollout_scope != RolloutScope::None && !backup_failed.is_empty() {
+        let stores = targets
+            .iter()
+            .map(|target| {
+                let error = backup_failed
+                    .get(&target.db_path)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        "skipped because another store could not be backed up before rollout rewrite"
+                            .to_string()
+                    });
+                StoreReconcileResult {
+                    kind: target.kind,
+                    db_path: target.db_path.clone(),
+                    outcome: StoreOutcome::Failed { error },
+                }
+            })
+            .collect();
+        return Ok(MultiReconcileSummary {
+            provider,
+            stores,
+            changed_rollouts: 0,
+            checked_rollouts: 0,
+            prepared_rollouts: 0,
+            skipped_rollouts: 0,
+            rollout_journal_path: None,
+            elapsed: started.elapsed(),
+        });
+    }
+
+    // 2) Rollout JSONL is the shared, durable source of truth. Collect targets
+    //    across every backed-up store (deduped by canonical path) and rewrite
+    //    once, before any SQLite row is flipped.
+    let store_db_paths: Vec<PathBuf> = targets
+        .iter()
+        .filter(|target| !backup_failed.contains_key(&target.db_path))
+        .map(|target| target.db_path.clone())
+        .collect();
+    let rollout_journal_path = codex_home
+        .join("backups")
+        .join(format!("rollouts.{}.jsonl", unix_timestamp_millis()?));
+    let rollout_outcome = reconcile_rollouts_for_stores(
+        store_db_paths.as_slice(),
+        provider.as_str(),
+        rollout_scope,
+        Some(rollout_journal_path.as_path()),
+        padding_bytes,
+        progress,
+    )?;
+    let rollout_summary = rollout_outcome.summary;
+    let rollout_failed: HashMap<PathBuf, String> =
+        rollout_outcome.failed_stores.into_iter().collect();
+
+    // 3) Reconcile each backed-up store's SQLite. A store whose rollouts could
+    //    not be read is marked Failed and its DB is left untouched, so we never
+    //    flip a DB while its rollouts stay stale; other per-store failures are
+    //    likewise reported without aborting the healthy stores.
+    let stores: Vec<StoreReconcileResult> = targets
+        .iter()
+        .map(|target| {
+            if let Some(error) = backup_failed.get(&target.db_path) {
+                return StoreReconcileResult {
+                    kind: target.kind,
+                    db_path: target.db_path.clone(),
+                    outcome: StoreOutcome::Failed {
+                        error: error.clone(),
+                    },
+                };
+            }
+            if let Some(error) = rollout_failed.get(&target.db_path) {
+                return StoreReconcileResult {
+                    kind: target.kind,
+                    db_path: target.db_path.clone(),
+                    outcome: StoreOutcome::Failed {
+                        error: error.clone(),
+                    },
+                };
+            }
+            let backup_path = backup_paths
+                .remove(&target.db_path)
+                .expect("backup was prepared for ready store");
+            reconcile_single_store(target, provider.as_str(), backup_path)
+        })
+        .collect();
+
+    Ok(MultiReconcileSummary {
+        provider,
+        stores,
+        changed_rollouts: rollout_summary.changed_files,
+        checked_rollouts: rollout_summary.checked_files,
+        prepared_rollouts: rollout_summary.prepared_files,
+        skipped_rollouts: rollout_summary.skipped_files,
+        rollout_journal_path: rollout_summary.journal_path,
+        elapsed: started.elapsed(),
+    })
+}
+
+fn create_store_backup(target: &StoreTarget) -> Result<PathBuf> {
+    let backups_dir = target
+        .db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("backups")
+        .join(target.kind.slug());
+    create_sqlite_backup_file_in(&target.db_path, &backups_dir)
+}
+
+fn reconcile_single_store(
+    target: &StoreTarget,
+    provider: &str,
+    backup_path: PathBuf,
+) -> StoreReconcileResult {
+    let outcome = match reconcile_single_store_inner(target, provider, backup_path) {
+        Ok((changed_rows, total_rows, backup_path)) => StoreOutcome::Updated {
+            changed_rows,
+            total_rows,
+            backup_path: Some(backup_path),
+        },
+        Err(error) => StoreOutcome::Failed {
+            error: error.to_string(),
+        },
+    };
+    StoreReconcileResult {
+        kind: target.kind,
+        db_path: target.db_path.clone(),
+        outcome,
+    }
+}
+
+fn reconcile_single_store_inner(
+    target: &StoreTarget,
+    provider: &str,
+    backup_path: PathBuf,
+) -> Result<(u64, u64, PathBuf)> {
+    let (changed_rows, total_rows) = reconcile_sqlite_in_place(&target.db_path, provider)?;
+    Ok((changed_rows, total_rows, backup_path))
+}
+
 pub(crate) fn reconcile_once(
     codex_home: &Path,
     provider_override: Option<&str>,
@@ -209,94 +487,6 @@ fn reconcile_once_with_progress_unlocked(
         skipped_rollouts: rollout_summary.skipped_files,
         elapsed: started.elapsed(),
         backup_path: None,
-        rollout_journal_path: rollout_summary.journal_path,
-    })
-}
-
-pub(crate) fn reconcile_once_with_backup_progress(
-    codex_home: &Path,
-    provider_override: Option<&str>,
-    profile_override: Option<&str>,
-    rollout_scope: RolloutScope,
-    progress: Option<RolloutProgressConfig>,
-) -> Result<ReconcileSummary> {
-    reconcile_once_with_backup_and_padding(
-        codex_home,
-        provider_override,
-        profile_override,
-        rollout_scope,
-        DEFAULT_BUCKET_PADDING_BYTES,
-        progress,
-    )
-}
-
-pub(crate) fn reconcile_once_with_backup_and_padding(
-    codex_home: &Path,
-    provider_override: Option<&str>,
-    profile_override: Option<&str>,
-    rollout_scope: RolloutScope,
-    padding_bytes: usize,
-    progress: Option<RolloutProgressConfig>,
-) -> Result<ReconcileSummary> {
-    with_threadripper_lock(codex_home, || {
-        reconcile_once_with_backup_and_padding_unlocked(
-            codex_home,
-            provider_override,
-            profile_override,
-            rollout_scope,
-            padding_bytes,
-            progress,
-        )
-    })
-}
-
-fn reconcile_once_with_backup_and_padding_unlocked(
-    codex_home: &Path,
-    provider_override: Option<&str>,
-    profile_override: Option<&str>,
-    rollout_scope: RolloutScope,
-    padding_bytes: usize,
-    progress: Option<RolloutProgressConfig>,
-) -> Result<ReconcileSummary> {
-    let provider = match provider_override {
-        Some(provider) => provider.to_string(),
-        None => read_provider_from_config(codex_home, profile_override)?,
-    };
-    let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
-    let started = Instant::now();
-    let backup_path = create_sqlite_backup_file(&sqlite_path)?;
-    let rollout_journal_path =
-        backup_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!(
-                "rollouts.{}.jsonl",
-                backup_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("state-db.bak")
-            ));
-    let rollout_summary = reconcile_rollout_metadata_from_sqlite_with_progress(
-        &sqlite_path,
-        codex_home,
-        provider.as_str(),
-        rollout_scope,
-        Some(rollout_journal_path.as_path()),
-        padding_bytes,
-        progress,
-    )?;
-    let (changed_rows, total_rows) = reconcile_sqlite_in_place(&sqlite_path, provider.as_str())?;
-
-    Ok(ReconcileSummary {
-        provider,
-        changed_rows,
-        total_rows,
-        changed_rollouts: rollout_summary.changed_files,
-        checked_rollouts: rollout_summary.checked_files,
-        prepared_rollouts: rollout_summary.prepared_files,
-        skipped_rollouts: rollout_summary.skipped_files,
-        elapsed: started.elapsed(),
-        backup_path: Some(backup_path),
         rollout_journal_path: rollout_summary.journal_path,
     })
 }

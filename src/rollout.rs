@@ -5,6 +5,7 @@ use filetime::set_file_times;
 use rusqlite::Connection;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -21,7 +22,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::codex_config::DEFAULT_PROVIDER;
-use crate::codex_config::resolve_sqlite_path;
 use crate::fs_sync::sync_dir;
 use crate::fs_sync::with_threadripper_lock;
 use crate::locale::Locale;
@@ -29,6 +29,7 @@ use crate::output::RolloutProgressSnapshot;
 use crate::output::rollout_progress_message;
 use crate::state_db::ensure_sqlite_exists;
 use crate::state_db::unix_timestamp_millis;
+use crate::stores::discover_stores;
 
 const ROLLOUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -184,6 +185,81 @@ pub(crate) fn reconcile_rollout_metadata_from_sqlite_with_progress(
     )
 }
 
+/// Result of a multi-store rollout reconcile: the aggregate rewrite summary plus
+/// the stores whose rollout targets could not be read.
+#[derive(Debug, Default)]
+pub(crate) struct MultiStoreRolloutOutcome {
+    pub(crate) summary: RolloutReconcileSummary,
+    /// `(db_path, error)` for each store whose rollout targets failed to load.
+    /// Callers must treat these stores as failed and skip writing their SQLite,
+    /// otherwise the DB could be flipped while its rollouts stayed stale.
+    pub(crate) failed_stores: Vec<(PathBuf, String)>,
+}
+
+/// Reconcile rollout metadata across multiple store DBs.
+///
+/// CLI and App surfaces share `CODEX_HOME/sessions`, so the same rollout JSONL
+/// can be referenced by more than one `state_5.sqlite`. Collect targets from
+/// every store, de-duplicate by canonical rollout path, and rewrite each file's
+/// provider exactly once (the rewrite is idempotent, but de-duping avoids
+/// re-reading and double-counting shared files).
+///
+/// A store whose targets can't be read is recorded in `failed_stores` rather
+/// than aborting the whole rewrite: healthy stores are still reconciled, and the
+/// caller must skip the failed store's SQLite write so we never flip a DB whose
+/// rollouts were left untouched.
+pub(crate) fn reconcile_rollouts_for_stores(
+    store_db_paths: &[PathBuf],
+    provider: &str,
+    scope: RolloutScope,
+    journal_path: Option<&Path>,
+    padding_bytes: usize,
+    progress: Option<RolloutProgressConfig>,
+) -> Result<MultiStoreRolloutOutcome> {
+    if scope == RolloutScope::None {
+        return Ok(MultiStoreRolloutOutcome::default());
+    }
+    let (targets, failed_stores) = rollout_targets_for_store_paths(store_db_paths, provider, scope);
+    let summary = reconcile_rollout_metadata_files(
+        targets.as_slice(),
+        provider,
+        journal_path,
+        padding_bytes,
+        progress,
+    )?;
+    Ok(MultiStoreRolloutOutcome {
+        summary,
+        failed_stores,
+    })
+}
+
+fn rollout_targets_for_store_paths(
+    store_db_paths: &[PathBuf],
+    provider: &str,
+    scope: RolloutScope,
+) -> (Vec<RolloutTarget>, Vec<(PathBuf, String)>) {
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut targets: Vec<RolloutTarget> = Vec::new();
+    let mut failed_stores: Vec<(PathBuf, String)> = Vec::new();
+    for db_path in store_db_paths {
+        match rollout_targets_for_scope(db_path, provider, scope) {
+            Ok(store_targets) => {
+                for target in store_targets {
+                    let key = target
+                        .path
+                        .canonicalize()
+                        .unwrap_or_else(|_| target.path.clone());
+                    if seen.insert(key) {
+                        targets.push(target);
+                    }
+                }
+            }
+            Err(error) => failed_stores.push((db_path.clone(), error.to_string())),
+        }
+    }
+    (targets, failed_stores)
+}
+
 fn rollout_targets_for_scope(
     sqlite_path: &Path,
     provider: &str,
@@ -337,9 +413,27 @@ fn prepare_bucket_padding_unlocked(
     profile_override: Option<&str>,
     padding_bytes: usize,
 ) -> Result<BucketPrepareSummary> {
-    let sqlite_path = resolve_sqlite_path(codex_home, profile_override)?;
     let started = Instant::now();
-    let targets = rollout_targets_for_scope(&sqlite_path, DEFAULT_PROVIDER, RolloutScope::AllRows)?;
+    let store_db_paths = discover_stores(codex_home, profile_override)?
+        .into_iter()
+        .map(|store| store.db_path)
+        .collect::<Vec<_>>();
+    if store_db_paths.is_empty() {
+        anyhow::bail!(
+            "no Codex state database found for bucket prepare under {}",
+            codex_home.display()
+        );
+    }
+    let (targets, failed_stores) =
+        rollout_targets_for_store_paths(&store_db_paths, DEFAULT_PROVIDER, RolloutScope::AllRows);
+    if !failed_stores.is_empty() {
+        let details = failed_stores
+            .into_iter()
+            .map(|(path, error)| format!("{}: {error}", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("failed to read rollout targets for bucket prepare: {details}");
+    }
     let journal_path = codex_home
         .join("backups")
         .join(format!("bucket-prepare.{}.jsonl", unix_timestamp_millis()?));

@@ -7,8 +7,11 @@ use crate::rollout::BucketPrepareSummary;
 use crate::service;
 use crate::service::ServiceInstallSummary;
 use crate::service::ServiceManager;
+use crate::sync::MultiReconcileSummary;
+use crate::sync::ReconcileStatus;
 use crate::sync::ReconcileSummary;
 use crate::sync::StatusSummary;
+use crate::sync::StoreOutcome;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RolloutProgressSnapshot {
@@ -183,6 +186,92 @@ pub(crate) fn print_sync_summary(locale: Locale, title: &str, summary: &Reconcil
             journal_path.display()
         );
     }
+}
+
+pub(crate) fn print_multi_sync_summary(
+    locale: Locale,
+    title: &str,
+    summary: &MultiReconcileSummary,
+) {
+    println!("{title}");
+    println!(
+        "{}: {}",
+        status_target_provider_label(locale),
+        summary.provider
+    );
+    if summary.checked_rollouts > 0 || summary.changed_rollouts > 0 {
+        println!(
+            "{}: {}",
+            sync_rollouts_checked_label(locale),
+            summary.checked_rollouts
+        );
+        println!(
+            "{}: {}",
+            sync_rollouts_updated_label(locale),
+            summary.changed_rollouts
+        );
+        if summary.prepared_rollouts > 0 {
+            println!(
+                "{}: {}",
+                sync_rollouts_prepared_label(locale),
+                summary.prepared_rollouts
+            );
+        }
+        if summary.skipped_rollouts > 0 {
+            println!(
+                "{}: {}",
+                sync_rollouts_skipped_label(locale),
+                summary.skipped_rollouts
+            );
+        }
+    }
+
+    println!();
+    println!("{}", sync_stores_heading(locale));
+    for store in &summary.stores {
+        println!();
+        println!("  [{}] {}", store.kind.slug(), store.kind.label(locale));
+        println!(
+            "    {}: {}",
+            status_sqlite_file_label(locale),
+            store.db_path.display()
+        );
+        match &store.outcome {
+            StoreOutcome::Updated {
+                changed_rows,
+                total_rows,
+                backup_path,
+            } => {
+                println!("    {}: {}", sync_rows_updated_label(locale), changed_rows);
+                println!("    {}: {}", status_total_threads_label(locale), total_rows);
+                if let Some(backup_path) = backup_path {
+                    println!(
+                        "    {}: {}",
+                        sync_backup_label(locale),
+                        backup_path.display()
+                    );
+                }
+            }
+            StoreOutcome::Failed { error } => {
+                println!("    {}: {}", sync_store_failed_label(locale), error);
+            }
+        }
+    }
+
+    println!();
+    if let Some(journal_path) = &summary.rollout_journal_path {
+        println!(
+            "{}: {}",
+            sync_rollout_journal_label(locale),
+            journal_path.display()
+        );
+    }
+    println!(
+        "{}: {} ms",
+        sync_elapsed_label(locale),
+        summary.elapsed.as_millis()
+    );
+    println!("{}", reconcile_status_line(locale, summary.status()));
 }
 
 pub(crate) fn print_bucket_prepare_summary(locale: Locale, summary: &BucketPrepareSummary) {
@@ -834,6 +923,50 @@ pub(crate) fn status_split_note(locale: Locale) -> &'static str {
         }
         Locale::ZhHans => {
             "说明：threadripper 只在每个库内部归一 provider，不会跨库合并 CLI 与 App 的历史。"
+        }
+    }
+}
+
+pub(crate) fn sync_stores_heading(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Stores:",
+        Locale::ZhHans => "存储面：",
+    }
+}
+
+pub(crate) fn sync_store_failed_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Failed",
+        Locale::ZhHans => "失败",
+    }
+}
+
+pub(crate) fn reconcile_status_line(locale: Locale, status: ReconcileStatus) -> String {
+    match (status, locale) {
+        (ReconcileStatus::Full, Locale::En) => "Result: all stores updated.".to_string(),
+        (ReconcileStatus::Full, Locale::ZhHans) => "结果：所有库均已更新。".to_string(),
+        (ReconcileStatus::Partial, Locale::En) => {
+            "Result: PARTIAL — some stores updated, at least one failed (see above). Re-run after resolving the failure.".to_string()
+        }
+        (ReconcileStatus::Partial, Locale::ZhHans) => {
+            "结果：部分成功 —— 部分库已更新，至少一个失败（见上）。解决后请重跑。".to_string()
+        }
+        (ReconcileStatus::Failed, Locale::En) => {
+            "Result: FAILED — no store could be updated.".to_string()
+        }
+        (ReconcileStatus::Failed, Locale::ZhHans) => {
+            "结果：失败 —— 没有任何库被更新。".to_string()
+        }
+    }
+}
+
+pub(crate) fn sqlite_only_app_warning(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => {
+            "Warning: --sqlite-only edits to the Codex App store take effect immediately but may be reverted by Codex's startup backfill, because the rollout JSONL is the source of truth. Run a full sync (without --sqlite-only) to persist the change."
+        }
+        Locale::ZhHans => {
+            "警告：--sqlite-only 对 Codex App 库的改动会立即生效，但可能被 Codex 启动时的 backfill 从 rollout 还原（rollout 才是事实源）。要持久化请运行完整 sync（不加 --sqlite-only）。"
         }
     }
 }

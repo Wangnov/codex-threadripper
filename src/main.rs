@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 
 mod cli;
@@ -20,6 +21,7 @@ mod watch;
 
 use cli::BucketCommand;
 use cli::Command;
+use cli::DEFAULT_BUCKET_PADDING_BYTES;
 use cli::parse_cli;
 use cli::validate_profile_override;
 use cli::validate_provider_override;
@@ -34,20 +36,31 @@ use output::next_steps_heading;
 use output::no_launchd_plist_message;
 use output::print_bucket_prepare_summary;
 use output::print_install_service_summary;
+use output::print_multi_sync_summary;
 use output::print_status;
-use output::print_sync_summary;
 use output::run_status_next_step;
+use output::sqlite_only_app_warning;
 use output::sync_complete_title;
 use output::uninstall_launchd_done;
 use rollout::RolloutProgressConfig;
 use rollout::RolloutScope;
 use rollout::prepare_bucket_padding;
+use sync::ReconcileStatus;
 use sync::collect_status;
-use sync::reconcile_once_with_backup_and_padding;
-use sync::reconcile_once_with_backup_progress;
+use sync::reconcile_all_stores_with_backup;
 use watch::run_watch;
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("{err:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<ExitCode> {
     let locale = detect_locale();
     let cli = parse_cli(locale)?;
     validate_provider_override(locale, cli.provider.as_deref())?;
@@ -59,6 +72,7 @@ fn main() -> Result<()> {
             let summary =
                 collect_status(&codex_home, cli.provider.as_deref(), cli.profile.as_deref())?;
             print_status(locale, &summary);
+            Ok(ExitCode::SUCCESS)
         }
         Command::Sync { sqlite_only } => {
             let rollout_scope = if sqlite_only {
@@ -71,20 +85,26 @@ fn main() -> Result<()> {
             } else {
                 Some(RolloutProgressConfig { locale })
             };
-            let summary = reconcile_once_with_backup_progress(
+            let summary = reconcile_all_stores_with_backup(
                 &codex_home,
                 cli.provider.as_deref(),
                 cli.profile.as_deref(),
                 rollout_scope,
+                DEFAULT_BUCKET_PADDING_BYTES,
                 progress,
             )?;
-            print_sync_summary(locale, sync_complete_title(locale), &summary);
+            print_multi_sync_summary(locale, sync_complete_title(locale), &summary);
+            if sqlite_only && summary.touches_app_store(&codex_home) {
+                eprintln!("{}", sqlite_only_app_warning(locale));
+            }
+            Ok(exit_code_for(summary.status()))
         }
         Command::Bucket { command } => match command {
             BucketCommand::Prepare { padding_bytes } => {
                 let summary =
                     prepare_bucket_padding(&codex_home, cli.profile.as_deref(), padding_bytes)?;
                 print_bucket_prepare_summary(locale, &summary);
+                Ok(ExitCode::SUCCESS)
             }
             BucketCommand::Switch {
                 target_provider,
@@ -95,7 +115,7 @@ fn main() -> Result<()> {
                     Some(provider) => Some(provider),
                     None => cli.provider.clone(),
                 };
-                let summary = reconcile_once_with_backup_and_padding(
+                let summary = reconcile_all_stores_with_backup(
                     &codex_home,
                     provider.as_deref(),
                     cli.profile.as_deref(),
@@ -103,7 +123,8 @@ fn main() -> Result<()> {
                     padding_bytes,
                     Some(RolloutProgressConfig { locale }),
                 )?;
-                print_sync_summary(locale, bucket_switch_complete_title(locale), &summary);
+                print_multi_sync_summary(locale, bucket_switch_complete_title(locale), &summary);
+                Ok(exit_code_for(summary.status()))
             }
         },
         Command::Watch {
@@ -122,6 +143,7 @@ fn main() -> Result<()> {
                 },
                 Duration::from_millis(poll_interval_ms),
             )?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::PrintServiceConfig { poll_interval_ms } => {
             let exe_path = std::env::current_exe().context(current_exe_error(locale))?;
@@ -133,6 +155,7 @@ fn main() -> Result<()> {
                 Duration::from_millis(poll_interval_ms),
             )?;
             println!("{config}");
+            Ok(ExitCode::SUCCESS)
         }
         Command::InstallService { poll_interval_ms } => {
             install_service(
@@ -142,13 +165,21 @@ fn main() -> Result<()> {
                 cli.profile.as_deref(),
                 Duration::from_millis(poll_interval_ms),
             )?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::UninstallService => {
             uninstall_service(locale, &codex_home)?;
+            Ok(ExitCode::SUCCESS)
         }
     }
+}
 
-    Ok(())
+fn exit_code_for(status: ReconcileStatus) -> ExitCode {
+    match status {
+        ReconcileStatus::Full => ExitCode::SUCCESS,
+        ReconcileStatus::Partial => ExitCode::from(2),
+        ReconcileStatus::Failed => ExitCode::FAILURE,
+    }
 }
 
 fn resolve_codex_home(cli_codex_home: Option<PathBuf>) -> Result<PathBuf> {
