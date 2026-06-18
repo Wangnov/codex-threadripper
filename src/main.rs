@@ -205,8 +205,39 @@ fn resolve_codex_home(cli_codex_home: Option<PathBuf>) -> Result<PathBuf> {
     resolve_codex_home_from_env(
         cli_codex_home,
         std::env::var_os("CODEX_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        home_base_from_env(
+            std::env::var_os("USERPROFILE").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+            cfg!(windows),
+        ),
     )
+}
+
+/// Resolve the base directory the default `.codex` home hangs off of when
+/// neither `--codex-home` nor `CODEX_HOME` is set.
+///
+/// This mirrors how Codex itself locates its home via `dirs::home_dir()`: on
+/// Windows that resolves from `USERPROFILE` and never consults `HOME`, while on
+/// Unix it uses `HOME`. threadripper historically looked only at `HOME`, so any
+/// process that injects `HOME` (e.g. an app pointing it at `%APPDATA%\<app>`)
+/// sent us to the wrong `.codex` while Codex kept writing under
+/// `%USERPROFILE%\.codex`. Preferring `USERPROFILE` on Windows realigns the two;
+/// `HOME` stays as a fallback there for shells that only set it (Git Bash, MSYS).
+fn home_base_from_env(
+    userprofile: Option<PathBuf>,
+    home: Option<PathBuf>,
+    is_windows: bool,
+) -> Option<PathBuf> {
+    fn non_empty(path: PathBuf) -> Option<PathBuf> {
+        (!path.as_os_str().is_empty()).then_some(path)
+    }
+    if is_windows {
+        userprofile
+            .and_then(non_empty)
+            .or_else(|| home.and_then(non_empty))
+    } else {
+        home.and_then(non_empty)
+    }
 }
 
 fn resolve_codex_home_from_env(
