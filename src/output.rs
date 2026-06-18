@@ -351,10 +351,10 @@ pub(crate) fn bytes_value_name(locale: Locale) -> &'static str {
 pub(crate) fn codex_home_help(locale: Locale) -> &'static str {
     match locale {
         Locale::En => {
-            "Codex home directory. Defaults to CODEX_HOME, then <home>/.codex (USERPROFILE on Windows, else HOME)."
+            "Codex home directory. Defaults to CODEX_HOME, then the OS home directory's .codex (resolved like Codex; on Windows, HOME/USERPROFILE overrides are ignored)."
         }
         Locale::ZhHans => {
-            "Codex home 目录。默认依次使用 CODEX_HOME、家目录下的 .codex(Windows 取 USERPROFILE,其余取 HOME)。"
+            "Codex home 目录。默认依次使用 CODEX_HOME、操作系统家目录下的 .codex(与 Codex 一致;Windows 忽略 HOME/USERPROFILE 改写)。"
         }
     }
 }

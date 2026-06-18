@@ -722,8 +722,7 @@ fn codex_home_tag(codex_home: &Path) -> String {
 }
 
 fn default_codex_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".codex")
 }
@@ -739,23 +738,11 @@ fn executable_paths_match(actual: &Path, expected: &Path) -> bool {
     }
 }
 
+/// Locate the OS home directory the same way Codex (and `resolve_codex_home`)
+/// do: via `dirs::home_dir()`, so service config, runtime, and log paths follow
+/// the real user profile on Windows instead of a relocated `HOME`/`USERPROFILE`.
 fn home_dir() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Some(path) = std::env::var_os("USERPROFILE") {
-        return Ok(PathBuf::from(path));
-    }
-    let home_drive = std::env::var_os("HOMEDRIVE");
-    let home_path = std::env::var_os("HOMEPATH");
-    match (home_drive, home_path) {
-        (Some(drive), Some(path)) => {
-            let mut joined = PathBuf::from(drive);
-            joined.push(path);
-            Ok(joined)
-        }
-        _ => anyhow::bail!("HOME is not set"),
-    }
+    dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
 }
 
 fn windows_appdata_dir() -> Result<PathBuf> {

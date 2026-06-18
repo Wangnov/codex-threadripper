@@ -249,6 +249,10 @@ fn resolves_codex_home_from_cli_then_env_then_home() -> Result<()> {
         crate::resolve_codex_home_from_env(None, None, Some(PathBuf::from("/home")))?,
         PathBuf::from("/home/.codex")
     );
+    // No CLI flag, no CODEX_HOME, and no resolvable home dir -> error, never a
+    // cwd-relative `.codex` (matches Codex's find_codex_home).
+    let err = crate::resolve_codex_home_from_env(None, None, None).unwrap_err();
+    assert!(err.to_string().contains("home directory"));
     let invalid_env_path = env_dir.path().join("not-a-directory");
     fs::write(&invalid_env_path, "not a directory")?;
     let err = crate::resolve_codex_home_from_env(
@@ -266,62 +270,16 @@ fn resolves_codex_home_from_cli_then_env_then_home() -> Result<()> {
 }
 
 #[test]
-fn home_base_prefers_userprofile_on_windows() -> Result<()> {
-    // Windows: USERPROFILE wins and HOME is ignored even when both are set —
-    // this is the reported regression (HOME hijacked to %APPDATA%\<app>).
-    assert_eq!(
-        crate::home_base_from_env(
-            Some(PathBuf::from(r"C:\Users\alice")),
-            Some(PathBuf::from(r"C:\Users\alice\AppData\Roaming\SPB_16.6")),
-            true,
-        ),
-        Some(PathBuf::from(r"C:\Users\alice")),
-    );
-    // Windows: fall back to HOME when USERPROFILE is missing or empty.
-    assert_eq!(
-        crate::home_base_from_env(None, Some(PathBuf::from(r"C:\home")), true),
-        Some(PathBuf::from(r"C:\home")),
-    );
-    assert_eq!(
-        crate::home_base_from_env(Some(PathBuf::new()), Some(PathBuf::from(r"C:\home")), true),
-        Some(PathBuf::from(r"C:\home")),
-    );
-    // Windows: nothing usable -> None (caller then defaults to ".").
-    assert_eq!(crate::home_base_from_env(None, None, true), None);
-    assert_eq!(
-        crate::home_base_from_env(Some(PathBuf::new()), None, true),
-        None,
-    );
-
-    // Non-Windows: HOME is authoritative and USERPROFILE is ignored.
-    assert_eq!(
-        crate::home_base_from_env(
-            Some(PathBuf::from("/should/ignore")),
-            Some(PathBuf::from("/home/alice")),
-            false,
-        ),
-        Some(PathBuf::from("/home/alice")),
-    );
-    assert_eq!(
-        crate::home_base_from_env(Some(PathBuf::from("/should/ignore")), None, false),
-        None,
-    );
-
-    // End-to-end: with HOME hijacked but USERPROFILE intact, the default Codex
-    // home still resolves under the real user profile, not the app dir.
-    assert_eq!(
-        crate::resolve_codex_home_from_env(
-            None,
-            None,
-            crate::home_base_from_env(
-                Some(PathBuf::from(r"C:\Users\alice")),
-                Some(PathBuf::from(r"C:\Users\alice\AppData\Roaming\SPB_16.6")),
-                true,
-            ),
-        )?,
-        PathBuf::from(r"C:\Users\alice").join(".codex"),
-    );
-    Ok(())
+fn default_home_base_uses_dirs_home_dir() {
+    // Codex resolves CODEX_HOME's default via dirs::home_dir() — the Known
+    // Folder API on Windows, $HOME elsewhere — never the raw HOME/USERPROFILE
+    // env vars. threadripper feeds the same source as the home base, so the
+    // default resolves to <home>/.codex, exactly the join Codex performs.
+    if let Some(home) = dirs::home_dir() {
+        let resolved = crate::resolve_codex_home_from_env(None, None, Some(home.clone()))
+            .expect("default home base");
+        assert_eq!(resolved, home.join(".codex"));
+    }
 }
 
 #[test]
