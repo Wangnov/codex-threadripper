@@ -20,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use crate::codex_config::DEFAULT_PROVIDER;
 use crate::fs_sync::sync_dir;
@@ -33,6 +34,7 @@ use crate::stores::StoreFilter;
 use crate::stores::discover_stores;
 
 const ROLLOUT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+const ROLLOUT_GROWTH_REWRITE_MIN_AGE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RolloutScope {
@@ -162,6 +164,7 @@ struct RolloutChangeJournal {
 #[derive(Clone, Copy)]
 enum RolloutChangeMode {
     InPlace,
+    Rewrite,
 }
 
 #[cfg(test)]
@@ -393,9 +396,36 @@ fn rewrite_rollout_provider_first_line(
         });
     }
 
-    let _ = padding_bytes;
+    if !rollout_is_old_enough(&original_metadata, ROLLOUT_GROWTH_REWRITE_MIN_AGE) {
+        return Ok(RolloutPatchOutcome {
+            skipped: true,
+            ..RolloutPatchOutcome::default()
+        });
+    }
+
+    let rendered_len = rendered.len();
+    let replacement_len = rendered_len + padding_bytes;
+    let mut replacement = rendered;
+    replacement.resize(replacement_len, b' ');
+    record_rollout_change(
+        journal,
+        target,
+        old_provider.as_str(),
+        provider,
+        first_line.content.len(),
+        replacement.len(),
+        RolloutChangeMode::Rewrite,
+    )?;
+    rewrite_first_line_with_replacement(
+        &target.path,
+        replacement.as_slice(),
+        first_line.newline.as_slice(),
+        &original_metadata,
+        original_times,
+    )?;
     Ok(RolloutPatchOutcome {
-        skipped: true,
+        changed: true,
+        prepared: replacement_len > rendered_len,
         ..RolloutPatchOutcome::default()
     })
 }
@@ -557,6 +587,82 @@ fn patch_first_line_in_place(
     Ok(())
 }
 
+fn rewrite_first_line_with_replacement(
+    path: &Path,
+    replacement: &[u8],
+    newline: &[u8],
+    original_metadata: &fs::Metadata,
+    original_times: (FileTime, FileTime),
+) -> Result<()> {
+    let temp_path = rollout_temp_path(path)?;
+    let result = (|| -> Result<()> {
+        let file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let mut old_first_line = Vec::new();
+        reader
+            .read_until(b'\n', &mut old_first_line)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        let temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        let mut writer = BufWriter::new(temp_file);
+        writer
+            .write_all(replacement)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        writer
+            .write_all(newline)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        std::io::copy(&mut reader, &mut writer)
+            .with_context(|| format!("failed to copy {}", path.display()))?;
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .with_context(|| format!("fsync: {}", temp_path.display()))?;
+        drop(writer);
+
+        fs::set_permissions(&temp_path, original_metadata.permissions())
+            .with_context(|| format!("failed to set permissions on {}", temp_path.display()))?;
+        fs::rename(&temp_path, path)
+            .with_context(|| format!("failed to replace {}", path.display()))?;
+        restore_file_times(path, original_times)?;
+        if let Some(parent) = path.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn rollout_temp_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rollout.jsonl");
+    Ok(path.with_file_name(format!(
+        "{file_name}.threadripper.{}.tmp",
+        unix_timestamp_millis()?
+    )))
+}
+
+fn rollout_is_old_enough(metadata: &fs::Metadata, min_age: Duration) -> bool {
+    let Ok(modified_at) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified_at)
+        .is_ok_and(|age| age >= min_age)
+}
+
 fn file_times_from_metadata(metadata: &fs::Metadata) -> (FileTime, FileTime) {
     (
         FileTime::from_last_access_time(metadata),
@@ -650,6 +756,7 @@ impl RolloutChangeMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::InPlace => "in_place",
+            Self::Rewrite => "rewrite",
         }
     }
 }

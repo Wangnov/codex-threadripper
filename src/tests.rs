@@ -1626,6 +1626,63 @@ fn durable_sync_skips_longer_provider_without_padding() -> Result<()> {
 }
 
 #[test]
+fn durable_sync_rewrites_cold_longer_provider_with_padding() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    let sqlite_path = codex_home.join("state_5.sqlite");
+    let rollout_path = codex_home.join("sessions/2026/05/07/rollout-cold-no-padding.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"vm\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
+        ),
+    )?;
+    let original_mtime = FileTime::from_unix_time(1_700_000_200, 0);
+    set_file_times(&rollout_path, original_mtime, original_mtime)?;
+    let before_len = fs::metadata(&rollout_path)?.len();
+    seed_sqlite(&sqlite_path)?;
+    let connection = Connection::open(&sqlite_path)?;
+    connection.execute(
+        "UPDATE threads SET rollout_path = ?1, model_provider = 'vm' WHERE id = '1'",
+        [rollout_path.display().to_string()],
+    )?;
+    drop(connection);
+
+    let journal_path = codex_home.join("backups/rollouts.rewrite.jsonl");
+    let summary = reconcile_rollout_metadata_from_sqlite_with_progress(
+        &sqlite_path,
+        codex_home,
+        "openai",
+        RolloutScope::AllRows,
+        Some(journal_path.as_path()),
+        DEFAULT_BUCKET_PADDING_BYTES,
+        None,
+    )?;
+
+    assert_rollout_times(&rollout_path, original_mtime)?;
+    let after_len = fs::metadata(&rollout_path)?.len();
+    let rewritten = fs::read_to_string(&rollout_path)?;
+    let journal = fs::read_to_string(&journal_path)?;
+    assert_eq!(summary.checked_files, 1);
+    assert_eq!(summary.changed_files, 1);
+    assert_eq!(summary.prepared_files, 1);
+    assert_eq!(summary.skipped_files, 0);
+    assert!(after_len > before_len);
+    assert!(
+        rewritten
+            .lines()
+            .next()
+            .unwrap()
+            .contains("\"model_provider\":\"openai\"")
+    );
+    assert!(rewritten.contains("\"message\":\"hi\""));
+    assert!(journal.contains("\"mode\":\"rewrite\""));
+    Ok(())
+}
+
+#[test]
 fn mismatched_scope_followup_repairs_matching_sqlite_rollout_after_sqlite_changes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let codex_home = dir.path();

@@ -103,7 +103,7 @@ codex-threadripper install-service
 
 - `status`：查看当前 provider、SQLite 里各 provider 的线程分布，以及后台服务的运行状态
 - `sync`：立即执行一次收敛。执行前会在 SQLite 状态库旁边的 `backups/` 目录里写一份带时间戳的备份；如果 rollout 首行需要改写，也会写 compact journal
-- `bucket switch <provider>`：把全部历史切到指定 provider 可见桶；首行有 padding 时只做原地 patch
+- `bucket switch <provider>`：把全部历史切到指定 provider 可见桶；首行有 padding 时原地 patch，旧的冷 rollout 需要扩容时会安全重写并补 padding
 - `bucket prepare`：检查 rollout 首行 padding；需要扩容首行的文件会被跳过，避免替换仍可能被 Codex 写入的日志文件
 - `watch`：持续监听 `config.toml` 的变化，同时定时收敛新增的线程记录
 - `print-service-config`：打印当前平台的后台服务配置内容（launchd plist / systemd unit / Windows 隐藏 VBS 启动器）
@@ -123,7 +123,7 @@ codex-threadripper install-service
 ## 它会改什么
 
 - `sync` 会在 SQLite 状态库旁边的 `backups/` 目录里创建备份，然后更新 `state_5.sqlite` 里的 `model_provider` 字段
-- `sync` / `bucket switch` 也会在不扩容首行的前提下改写 rollout JSONL 首行里的 provider 可见桶，并写入 compact journal；改写后会恢复原本的文件访问时间和修改时间，避免 Codex.app 的最近会话排序被工具污染。需要扩容首行的 rollout 会被跳过，避免替换仍可能被 Codex 写入的日志文件
+- `sync` / `bucket switch` 也会改写 rollout JSONL 首行里的 provider 可见桶，并写入 compact journal；有足够 padding 时会原地 patch，旧的冷 rollout 需要扩容时会通过临时文件安全重写并补 padding；刚写过、仍可能被 Codex 写入的 rollout 会被跳过，待稍后重跑。改写后会恢复原本的文件访问时间和修改时间，避免 Codex.app 的最近会话排序被工具污染
 - `watch` 在运行期间会持续处理新写入的线程记录，保持数据库与 rollout 首行里的 provider 可见桶和当前 provider 对齐
 - `--sqlite-only` 只更新 SQLite，适合只关心数据库索引的场景；当前 Codex.app 也会读取 rollout JSONL 元数据，所以日常可见性修复不建议使用它
 - 默认状态库路径是 `CODEX_HOME/state_5.sqlite`；如果 Codex 配置了 `sqlite_home` 或环境变量 `CODEX_SQLITE_HOME`，`codex-threadripper` 会跟随 Codex 使用对应目录下的 `state_5.sqlite`
@@ -220,7 +220,7 @@ codex-threadripper install-service
 
 - `status`: show the active provider, the per-provider thread counts from SQLite, and whether the background service is running
 - `sync`: reconcile once right now, writing a timestamped backup to the `backups/` directory beside the SQLite state DB; rollout first-line changes also get a compact journal
-- `bucket switch <provider>`: move all history into the requested provider visibility bucket; prepared first lines are patched in place
+- `bucket switch <provider>`: move all history into the requested provider visibility bucket; prepared first lines are patched in place, while older cold rollouts that need first-line growth are safely rewritten with padding
 - `bucket prepare`: inspect rollout first-line padding; files that would require first-line growth are skipped so the tool does not replace logs Codex may still be writing
 - `watch`: keep watching `config.toml` for provider changes and periodically reconcile any newly added thread rows
 - `print-service-config`: print the platform-specific service config (launchd plist, systemd unit, or Windows hidden VBS launcher) without installing it
@@ -240,7 +240,7 @@ Every command accepts `--provider <provider>` to force the target bucket, or `--
 ## What it changes
 
 - `sync` writes a backup next to the SQLite state DB and then updates the `model_provider` column in `state_5.sqlite`
-- `sync` / `bucket switch` also rewrite the provider visibility bucket in rollout JSONL first lines when this can be done without growing the first line, and write a compact journal; after each rewrite, the original file access and modification times are restored so Codex.app's recent-thread ordering is not polluted by the tool. Rollouts that would require first-line growth are skipped so the tool does not replace logs Codex may still be writing
+- `sync` / `bucket switch` also rewrite the provider visibility bucket in rollout JSONL first lines and write a compact journal. Prepared first lines are patched in place; older cold rollouts that need first-line growth are safely rewritten through a temporary file and padded for future switches; recently written rollouts that Codex may still be writing are skipped and can be retried later. After each rewrite, the original file access and modification times are restored so Codex.app's recent-thread ordering is not polluted by the tool
 - `watch` keeps both SQLite and rollout first-line provider buckets aligned with the active provider as new threads are written
 - `--sqlite-only` updates SQLite only. Use it only when you deliberately do not need rollout JSONL metadata; current Codex.app builds also read rollout metadata for visibility
 - The default state DB is `CODEX_HOME/state_5.sqlite`; if Codex uses `sqlite_home` or `CODEX_SQLITE_HOME`, `codex-threadripper` follows that directory and uses its `state_5.sqlite`
