@@ -31,10 +31,16 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.30.3/cargo-dist-installer.sh | sh
 
-      - name: Build Linux release archive
+      - name: Install Linux musl dependencies
         shell: bash
         run: |
-          dist build --artifacts=local --target x86_64-unknown-linux-gnu --output-format=json > dist-manifest.json
+          sudo apt-get update
+          sudo apt-get install musl-tools
+
+      - name: Build Linux musl release archive
+        shell: bash
+        run: |
+          dist build --artifacts=local --target x86_64-unknown-linux-musl --output-format=json > dist-manifest.json
 
       - name: Run Linux smoke test
         shell: bash
@@ -45,7 +51,7 @@ jobs:
 
           manifest = json.loads(Path("dist-manifest.json").read_text())
           for artifact in manifest["artifacts"].values():
-              if artifact["kind"] == "executable-zip" and "x86_64-unknown-linux-gnu" in artifact["target_triples"]:
+              if artifact["kind"] == "executable-zip" and "x86_64-unknown-linux-musl" in artifact["target_triples"]:
                   print(artifact["path"])
                   break
           PY

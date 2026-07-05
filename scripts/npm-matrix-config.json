@@ -29,8 +29,8 @@
     {
       "dirName": "linux-arm64",
       "packageName": "@wangnov/codex-threadripper-linux-arm64",
-      "description": "codex-threadripper prebuilt binary for Linux arm64",
-      "artifactName": "codex-threadripper-aarch64-unknown-linux-gnu.tar.xz",
+      "description": "codex-threadripper prebuilt static musl binary for Linux arm64",
+      "artifactName": "codex-threadripper-aarch64-unknown-linux-musl.tar.xz",
       "os": ["linux"],
       "cpu": ["arm64"],
       "binaryName": "codex-threadripper"
@@ -38,8 +38,8 @@
     {
       "dirName": "linux-x64",
       "packageName": "@wangnov/codex-threadripper-linux-x64",
-      "description": "codex-threadripper prebuilt binary for Linux x64",
-      "artifactName": "codex-threadripper-x86_64-unknown-linux-gnu.tar.xz",
+      "description": "codex-threadripper prebuilt static musl binary for Linux x64",
+      "artifactName": "codex-threadripper-x86_64-unknown-linux-musl.tar.xz",
       "os": ["linux"],
       "cpu": ["x64"],
       "binaryName": "codex-threadripper"
