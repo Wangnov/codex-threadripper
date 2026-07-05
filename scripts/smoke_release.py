@@ -362,7 +362,11 @@ def run_sync(binary_path: pathlib.Path, codex_home: pathlib.Path) -> pathlib.Pat
         raise RuntimeError(f"sync skipped rollout metadata rewrites\n\n{output}")
 
     backup_line = next(
-        (line for line in output.splitlines() if line.startswith("Backup: ")),
+        (
+            line.strip()
+            for line in output.splitlines()
+            if line.strip().startswith("Backup: ")
+        ),
         None,
     )
     if backup_line is None:
