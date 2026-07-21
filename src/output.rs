@@ -138,7 +138,8 @@ pub(crate) fn print_multi_sync_summary(
         status_target_provider_label(locale),
         summary.provider
     );
-    if summary.checked_rollouts > 0 || summary.changed_rollouts > 0 {
+    if summary.checked_rollouts > 0 || summary.changed_rollouts > 0 || summary.blocked_rollouts > 0
+    {
         println!(
             "{}: {}",
             sync_rollouts_checked_label(locale),

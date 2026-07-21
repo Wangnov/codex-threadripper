@@ -6,8 +6,6 @@ use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use rusqlite::backup::StepResult;
-use rusqlite::params_from_iter;
-use rusqlite::types::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -114,23 +112,30 @@ pub(crate) fn reconcile_sqlite_in_place_excluding(
             [provider],
         )? as u64
     } else {
-        let mut excluded_thread_ids = excluded_thread_ids.iter().collect::<Vec<_>>();
-        excluded_thread_ids.sort_unstable();
-        let placeholders = std::iter::repeat_n("?", excluded_thread_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "UPDATE threads SET model_provider = ? WHERE model_provider <> ? AND id NOT IN ({placeholders})"
-        );
-        let mut values = Vec::with_capacity(excluded_thread_ids.len() + 2);
-        values.push(Value::Text(provider.to_string()));
-        values.push(Value::Text(provider.to_string()));
-        values.extend(
-            excluded_thread_ids
-                .into_iter()
-                .map(|thread_id| Value::Text(thread_id.clone())),
-        );
-        transaction.execute(sql.as_str(), params_from_iter(values.iter()))? as u64
+        transaction.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS threadripper_excluded_threads (
+                id TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            DELETE FROM temp.threadripper_excluded_threads;",
+        )?;
+        {
+            let mut insert = transaction
+                .prepare("INSERT INTO temp.threadripper_excluded_threads (id) VALUES (?1)")?;
+            for thread_id in excluded_thread_ids {
+                insert.execute([thread_id])?;
+            }
+        }
+        transaction.execute(
+            "UPDATE threads
+             SET model_provider = ?1
+             WHERE model_provider <> ?1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM temp.threadripper_excluded_threads AS excluded
+                   WHERE excluded.id = threads.id
+               )",
+            [provider],
+        )? as u64
     };
     transaction.commit()?;
 

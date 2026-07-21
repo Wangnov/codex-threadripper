@@ -222,6 +222,7 @@ pub(crate) fn reconcile_rollouts_for_stores(
     store_db_paths: &[PathBuf],
     provider: &str,
     scope: RolloutScope,
+    known_blocked_thread_ids: &HashSet<String>,
     journal_path: Option<&Path>,
     padding_bytes: usize,
     progress: Option<RolloutProgressConfig>,
@@ -230,13 +231,27 @@ pub(crate) fn reconcile_rollouts_for_stores(
         return Ok(MultiStoreRolloutOutcome::default());
     }
     let (targets, failed_stores) = rollout_targets_for_store_paths(store_db_paths, provider, scope);
-    let summary = reconcile_rollout_metadata_files(
+    let mut cached_blocked_thread_ids = HashSet::new();
+    let targets = targets
+        .into_iter()
+        .filter(|target| {
+            if known_blocked_thread_ids.contains(&target.thread_id) {
+                cached_blocked_thread_ids.insert(target.thread_id.clone());
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut summary = reconcile_rollout_metadata_files(
         targets.as_slice(),
         provider,
         journal_path,
         padding_bytes,
         progress,
     )?;
+    summary.skipped_files += cached_blocked_thread_ids.len() as u64;
+    summary.blocked_thread_ids.extend(cached_blocked_thread_ids);
     Ok(MultiStoreRolloutOutcome {
         summary,
         failed_stores,

@@ -124,7 +124,7 @@ codex-threadripper install-service
 
 - `sync` 会在 SQLite 状态库旁边的 `backups/` 目录里创建备份，然后更新 `state_5.sqlite` 里的 `model_provider` 字段
 - `sync` / `bucket switch` 也会改写 rollout JSONL 首行里的 provider 可见桶，并写入 compact journal；有足够 padding 时会原地 patch，Legacy 模式下旧的冷 rollout 需要扩容时会通过临时文件安全重写并补 padding；刚写过、仍可能被 Codex 写入的 rollout 会被跳过，待稍后重跑。最新版 Codex 的分页历史会保存 rollout 字节偏移，因此需要增长首行的分页 rollout 会连同对应 SQLite provider 行一起保持不变，并以部分成功退出，避免留下失效的历史投影。改写后会恢复原本的文件访问时间和修改时间，避免 Codex.app 的最近会话排序被工具污染
-- `watch` 在运行期间会持续处理新写入的线程记录，保持数据库与 rollout 首行里的 provider 可见桶和当前 provider 对齐
+- `watch` 在运行期间会持续处理新写入的线程记录，保持数据库与 rollout 首行里的 provider 可见桶和当前 provider 对齐；稳定受阻的分页 rollout 会被缓存，避免每 500ms 重读和重复刷日志，并在配置变化或每 60 秒全量扫描时重新检查
 - `--sqlite-only` 只更新 SQLite，适合只关心数据库索引的场景；当前 Codex.app 也会读取 rollout JSONL 元数据，所以日常可见性修复不建议使用它
 - 默认状态库路径是 `CODEX_HOME/state_5.sqlite`；如果 Codex 配置了 `sqlite_home` 或环境变量 `CODEX_SQLITE_HOME`，`codex-threadripper` 会跟随 Codex 使用对应目录下的 `state_5.sqlite`
 
@@ -241,7 +241,7 @@ Every command accepts `--provider <provider>` to force the target bucket, or `--
 
 - `sync` writes a backup next to the SQLite state DB and then updates the `model_provider` column in `state_5.sqlite`
 - `sync` / `bucket switch` also rewrite the provider visibility bucket in rollout JSONL first lines and write a compact journal. Prepared first lines are patched in place; older cold legacy rollouts that need first-line growth are safely rewritten through a temporary file and padded for future switches; recently written rollouts that Codex may still be writing are skipped and can be retried later. Current Codex paginated history persists rollout byte offsets, so a paginated rollout that would need first-line growth is left unchanged together with its SQLite provider row and the command exits partially instead of invalidating the history projection. After each rewrite, the original file access and modification times are restored so Codex.app's recent-thread ordering is not polluted by the tool
-- `watch` keeps both SQLite and rollout first-line provider buckets aligned with the active provider as new threads are written
+- `watch` keeps both SQLite and rollout first-line provider buckets aligned with the active provider as new threads are written. Stable blocked paginated rollouts are cached instead of being reread and logged every 500 ms, then reevaluated after config changes or during the 60-second full scan
 - `--sqlite-only` updates SQLite only. Use it only when you deliberately do not need rollout JSONL metadata; current Codex.app builds also read rollout metadata for visibility
 - The default state DB is `CODEX_HOME/state_5.sqlite`; if Codex uses `sqlite_home` or `CODEX_SQLITE_HOME`, `codex-threadripper` follows that directory and uses its `state_5.sqlite`
 
