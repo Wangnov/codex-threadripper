@@ -1741,7 +1741,9 @@ fn paginated_growth_blocks_only_matching_rollout_and_sqlite_row() -> Result<()> 
     assert_eq!(summary.blocked_rollouts, 1);
     assert_eq!(summary.total_changed_rows(), 1);
     assert_eq!(fs::read(&rollout_path)?, original);
-    assert_rollout_times(&rollout_path, original_mtime)?;
+    let metadata = fs::metadata(&rollout_path)?;
+    let actual_mtime = FileTime::from_last_modification_time(&metadata);
+    assert_eq!(actual_mtime.unix_seconds(), original_mtime.unix_seconds());
     let connection = Connection::open(&sqlite_path)?;
     let blocked_provider: String = connection.query_row(
         "SELECT model_provider FROM threads WHERE id = '1'",
