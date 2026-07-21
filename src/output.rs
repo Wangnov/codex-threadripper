@@ -138,7 +138,8 @@ pub(crate) fn print_multi_sync_summary(
         status_target_provider_label(locale),
         summary.provider
     );
-    if summary.checked_rollouts > 0 || summary.changed_rollouts > 0 {
+    if summary.checked_rollouts > 0 || summary.changed_rollouts > 0 || summary.blocked_rollouts > 0
+    {
         println!(
             "{}: {}",
             sync_rollouts_checked_label(locale),
@@ -161,6 +162,13 @@ pub(crate) fn print_multi_sync_summary(
                 "{}: {}",
                 sync_rollouts_skipped_label(locale),
                 summary.skipped_rollouts
+            );
+        }
+        if summary.blocked_rollouts > 0 {
+            println!(
+                "{}: {}",
+                sync_paginated_rollouts_blocked_label(locale),
+                summary.blocked_rollouts
             );
         }
     }
@@ -945,10 +953,10 @@ pub(crate) fn reconcile_status_line(locale: Locale, status: ReconcileStatus) -> 
         (ReconcileStatus::Full, Locale::En) => "Result: all stores updated.".to_string(),
         (ReconcileStatus::Full, Locale::ZhHans) => "结果：所有库均已更新。".to_string(),
         (ReconcileStatus::Partial, Locale::En) => {
-            "Result: PARTIAL — some stores updated, at least one was skipped or failed (see above). Re-run after it is resolved.".to_string()
+            "Result: PARTIAL — at least one store or paginated rollout was left unchanged (see above). Re-run after it is resolved.".to_string()
         }
         (ReconcileStatus::Partial, Locale::ZhHans) => {
-            "结果：部分成功 —— 部分库已更新，至少一个被跳过或失败（见上）。解决后请重跑。".to_string()
+            "结果：部分成功 —— 至少一个存储面或分页 rollout 保持未变（见上）。解决后请重跑。".to_string()
         }
         (ReconcileStatus::Failed, Locale::En) => {
             "Result: FAILED — no store could be updated.".to_string()
@@ -1037,6 +1045,13 @@ pub(crate) fn sync_rollouts_skipped_label(locale: Locale) -> &'static str {
     match locale {
         Locale::En => "Rollouts skipped",
         Locale::ZhHans => "已跳过 rollout",
+    }
+}
+
+pub(crate) fn sync_paginated_rollouts_blocked_label(locale: Locale) -> &'static str {
+    match locale {
+        Locale::En => "Paginated rollouts kept unchanged to preserve history offsets",
+        Locale::ZhHans => "为保护历史偏移而保持未变的分页 rollout",
     }
 }
 

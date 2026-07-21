@@ -6,6 +6,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use rusqlite::backup::StepResult;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -88,7 +89,16 @@ pub(crate) fn read_backfill_status_with_timeout(
     Ok(status)
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> Result<(u64, u64)> {
+    reconcile_sqlite_in_place_excluding(sqlite_path, provider, &HashSet::new())
+}
+
+pub(crate) fn reconcile_sqlite_in_place_excluding(
+    sqlite_path: &Path,
+    provider: &str,
+    excluded_thread_ids: &HashSet<String>,
+) -> Result<(u64, u64)> {
     ensure_sqlite_exists(sqlite_path)?;
     let mut connection = Connection::open(sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
@@ -96,10 +106,37 @@ pub(crate) fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> R
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let total_rows: u64 =
         transaction.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
-    let changed_rows = transaction.execute(
-        "UPDATE threads SET model_provider = ?1 WHERE model_provider <> ?1",
-        [provider],
-    )? as u64;
+    let changed_rows = if excluded_thread_ids.is_empty() {
+        transaction.execute(
+            "UPDATE threads SET model_provider = ?1 WHERE model_provider <> ?1",
+            [provider],
+        )? as u64
+    } else {
+        transaction.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS threadripper_excluded_threads (
+                id TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            DELETE FROM temp.threadripper_excluded_threads;",
+        )?;
+        {
+            let mut insert = transaction
+                .prepare("INSERT INTO temp.threadripper_excluded_threads (id) VALUES (?1)")?;
+            for thread_id in excluded_thread_ids {
+                insert.execute([thread_id])?;
+            }
+        }
+        transaction.execute(
+            "UPDATE threads
+             SET model_provider = ?1
+             WHERE model_provider <> ?1
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM temp.threadripper_excluded_threads AS excluded
+                   WHERE excluded.id = threads.id
+               )",
+            [provider],
+        )? as u64
+    };
     transaction.commit()?;
 
     Ok((changed_rows, total_rows))

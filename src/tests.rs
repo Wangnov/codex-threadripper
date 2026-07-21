@@ -22,6 +22,7 @@ use crate::rollout::reconcile_rollout_metadata_from_sqlite_with_progress;
 use crate::service::ServiceManager;
 use crate::state_db::inspect_sqlite_distribution;
 use crate::state_db::reconcile_sqlite_in_place;
+use crate::state_db::reconcile_sqlite_in_place_excluding;
 use crate::state_db::reconcile_sqlite_with_backup;
 use crate::stores::StoreFilter;
 use crate::stores::StoreKind;
@@ -34,6 +35,7 @@ use crate::sync::StoreReconcileResult;
 use crate::sync::collect_status;
 use crate::sync::reconcile_all_stores;
 use crate::sync::reconcile_all_stores_with_backup;
+use crate::sync::reconcile_all_stores_with_known_blocked;
 use crate::watch::WATCH_FULL_ROLLOUT_POLL_INTERVALS;
 use crate::watch::full_watch_rollout_scope;
 use crate::watch::periodic_watch_rollout_scope;
@@ -45,6 +47,7 @@ use clap::error::ErrorKind;
 use filetime::FileTime;
 use filetime::set_file_times;
 use rusqlite::Connection;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1541,7 +1544,7 @@ fn durable_sync_patches_shorter_provider_in_place() -> Result<()> {
     fs::write(
         &rollout_path,
         concat!(
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"openai\"}}      \n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"openai\",\"history_mode\":\"paginated\"}}      \n",
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
         ),
     )?;
@@ -1679,6 +1682,151 @@ fn durable_sync_rewrites_cold_longer_provider_with_padding() -> Result<()> {
     );
     assert!(rewritten.contains("\"message\":\"hi\""));
     assert!(journal.contains("\"mode\":\"rewrite\""));
+    Ok(())
+}
+
+#[test]
+fn paginated_growth_blocks_only_matching_rollout_and_sqlite_row() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+    let sqlite_path = codex_home.join("state_5.sqlite");
+    let rollout_path = codex_home.join("sessions/2026/07/21/rollout-paginated.jsonl");
+    let legacy_rollout_path = codex_home.join("sessions/2026/07/21/rollout-legacy.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"vm\",\"history_mode\":\"paginated\"}}\n",
+            "{\"timestamp\":\"2026-07-21T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"},\"ordinal\":0}\n",
+        ),
+    )?;
+    fs::write(
+        &legacy_rollout_path,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"2\",\"model_provider\":\"vm\",\"history_mode\":\"legacy\"}}        \n",
+    )?;
+    let original = fs::read(&rollout_path)?;
+    let original_mtime = FileTime::from_unix_time(1_700_000_300, 0);
+    set_file_times(&rollout_path, original_mtime, original_mtime)?;
+
+    seed_sqlite(&sqlite_path)?;
+    let connection = Connection::open(&sqlite_path)?;
+    connection.execute(
+        "UPDATE threads SET model_provider = 'openai', rollout_path = ''",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE threads SET rollout_path = ?1, model_provider = 'vm' WHERE id = '1'",
+        [rollout_path.display().to_string()],
+    )?;
+    connection.execute(
+        "UPDATE threads SET rollout_path = ?1, model_provider = 'vm' WHERE id = '2'",
+        [legacy_rollout_path.display().to_string()],
+    )?;
+    drop(connection);
+
+    let summary = reconcile_all_stores(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        Duration::ZERO,
+        StoreFilter::All,
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Partial);
+    assert_eq!(summary.changed_rollouts, 1);
+    assert_eq!(summary.skipped_rollouts, 1);
+    assert_eq!(summary.blocked_rollouts, 1);
+    assert_eq!(summary.total_changed_rows(), 1);
+    assert_eq!(fs::read(&rollout_path)?, original);
+    let metadata = fs::metadata(&rollout_path)?;
+    let actual_mtime = FileTime::from_last_modification_time(&metadata);
+    assert_eq!(actual_mtime.unix_seconds(), original_mtime.unix_seconds());
+    let connection = Connection::open(&sqlite_path)?;
+    let blocked_provider: String = connection.query_row(
+        "SELECT model_provider FROM threads WHERE id = '1'",
+        [],
+        |row| row.get(0),
+    )?;
+    let updated_provider: String = connection.query_row(
+        "SELECT model_provider FROM threads WHERE id = '2'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(blocked_provider, "vm");
+    assert_eq!(updated_provider, "openai");
+    assert!(fs::read_to_string(&legacy_rollout_path)?.contains("\"model_provider\":\"openai\""));
+
+    let known_blocked_thread_ids = summary.blocked_thread_ids.clone();
+    fs::write(
+        &rollout_path,
+        "cached blocked rollout must not be reparsed\n",
+    )?;
+    let cached_summary = reconcile_all_stores_with_known_blocked(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::MismatchedRows,
+        Duration::ZERO,
+        StoreFilter::All,
+        None,
+        &known_blocked_thread_ids,
+    )?;
+    assert_eq!(cached_summary.status(), ReconcileStatus::Partial);
+    assert_eq!(cached_summary.changed_rollouts, 0);
+    assert_eq!(cached_summary.blocked_thread_ids, known_blocked_thread_ids);
+    assert_eq!(cached_summary.total_changed_rows(), 0);
+    Ok(())
+}
+
+#[test]
+fn sqlite_exclusions_scale_past_the_variable_limit() -> Result<()> {
+    const BLOCKED_ROWS: usize = 32_767;
+
+    let dir = tempfile::tempdir()?;
+    let sqlite_path = dir.path().join("state_5.sqlite");
+    let mut connection = Connection::open(&sqlite_path)?;
+    connection.execute_batch(
+        "CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            model_provider TEXT NOT NULL
+        );",
+    )?;
+    let transaction = connection.transaction()?;
+    let mut blocked_thread_ids = HashSet::with_capacity(BLOCKED_ROWS);
+    {
+        let mut insert =
+            transaction.prepare("INSERT INTO threads (id, model_provider) VALUES (?1, 'vm')")?;
+        for index in 0..BLOCKED_ROWS {
+            let thread_id = format!("blocked-{index}");
+            insert.execute([thread_id.as_str()])?;
+            blocked_thread_ids.insert(thread_id);
+        }
+        insert.execute(["allowed"])?;
+    }
+    transaction.commit()?;
+    drop(connection);
+
+    let (changed_rows, total_rows) =
+        reconcile_sqlite_in_place_excluding(&sqlite_path, "openai", &blocked_thread_ids)?;
+
+    assert_eq!(changed_rows, 1);
+    assert_eq!(total_rows, BLOCKED_ROWS as u64 + 1);
+    let connection = Connection::open(&sqlite_path)?;
+    let blocked_openai: u64 = connection.query_row(
+        "SELECT COUNT(*) FROM threads WHERE id LIKE 'blocked-%' AND model_provider = 'openai'",
+        [],
+        |row| row.get(0),
+    )?;
+    let allowed_provider: String = connection.query_row(
+        "SELECT model_provider FROM threads WHERE id = 'allowed'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(blocked_openai, 0);
+    assert_eq!(allowed_provider, "openai");
     Ok(())
 }
 
@@ -1856,11 +2004,53 @@ fn watch_prints_non_full_summary_even_when_counts_are_unchanged() {
         checked_rollouts: 0,
         prepared_rollouts: 0,
         skipped_rollouts: 0,
+        blocked_rollouts: 0,
+        blocked_thread_ids: HashSet::new(),
         rollout_journal_path: None,
         elapsed: Duration::ZERO,
     };
 
-    assert!(watch_should_print_summary(Some("openai"), &summary));
+    assert!(watch_should_print_summary(
+        Some("openai"),
+        &HashSet::new(),
+        &summary
+    ));
+}
+
+#[test]
+fn watch_suppresses_an_unchanged_paginated_block_summary() {
+    let blocked_thread_ids = HashSet::from(["blocked".to_string()]);
+    let summary = MultiReconcileSummary {
+        provider: "openai".to_string(),
+        stores: vec![StoreReconcileResult {
+            kind: StoreKind::Cli,
+            db_path: PathBuf::from("/tmp/state_5.sqlite"),
+            outcome: StoreOutcome::Updated {
+                changed_rows: 0,
+                total_rows: 1,
+                backup_path: None,
+            },
+        }],
+        changed_rollouts: 0,
+        checked_rollouts: 0,
+        prepared_rollouts: 0,
+        skipped_rollouts: 1,
+        blocked_rollouts: 1,
+        blocked_thread_ids: blocked_thread_ids.clone(),
+        rollout_journal_path: None,
+        elapsed: Duration::ZERO,
+    };
+
+    assert!(!watch_should_print_summary(
+        Some("openai"),
+        &blocked_thread_ids,
+        &summary
+    ));
+    assert!(watch_should_print_summary(
+        Some("openai"),
+        &HashSet::new(),
+        &summary
+    ));
 }
 
 #[test]

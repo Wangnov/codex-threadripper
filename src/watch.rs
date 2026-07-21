@@ -6,6 +6,7 @@ use notify::EventKind;
 use notify::RecommendedWatcher;
 use notify::RecursiveMode;
 use notify::Watcher;
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
@@ -32,8 +33,8 @@ use crate::output::watcher_error_message;
 use crate::rollout::RolloutScope;
 use crate::stores::StoreFilter;
 use crate::sync::MultiReconcileSummary;
-use crate::sync::ReconcileStatus;
 use crate::sync::reconcile_all_stores;
+use crate::sync::reconcile_all_stores_with_known_blocked;
 
 pub(crate) const WATCH_FULL_ROLLOUT_POLL_INTERVALS: u64 = 120;
 
@@ -85,6 +86,7 @@ pub(crate) fn run_watch(
     }
 
     let mut last_provider = None;
+    let mut known_blocked_thread_ids = HashSet::new();
     match reconcile_all_stores(
         codex_home,
         provider_override.as_deref(),
@@ -97,6 +99,7 @@ pub(crate) fn run_watch(
         Ok(summary) => {
             print_multi_sync_summary(locale, watch_started_title(locale), &summary);
             last_provider = Some(summary.provider.clone());
+            known_blocked_thread_ids = summary.blocked_thread_ids.clone();
         }
         Err(err) => {
             eprintln!("{}", watch_initial_reconcile_error_message(locale, &err));
@@ -125,7 +128,11 @@ pub(crate) fn run_watch(
                         None,
                     ) {
                         Ok(summary) => {
-                            if watch_should_print_summary(last_provider.as_deref(), &summary) {
+                            if watch_should_print_summary(
+                                last_provider.as_deref(),
+                                &known_blocked_thread_ids,
+                                &summary,
+                            ) {
                                 print_multi_sync_summary(
                                     locale,
                                     config_change_title(locale),
@@ -133,6 +140,7 @@ pub(crate) fn run_watch(
                                 );
                             }
                             last_provider = Some(summary.provider.clone());
+                            known_blocked_thread_ids = summary.blocked_thread_ids.clone();
                             watched_paths =
                                 watched_config_paths(codex_home, profile_override.as_deref());
                         }
@@ -148,17 +156,29 @@ pub(crate) fn run_watch(
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 poll_count = poll_count.wrapping_add(1);
-                match reconcile_all_stores(
+                let periodic_scope = periodic_watch_rollout_scope(rollout_scope, poll_count);
+                let empty_blocked_thread_ids = HashSet::new();
+                let blocked_thread_ids = if periodic_scope == RolloutScope::MismatchedRows {
+                    &known_blocked_thread_ids
+                } else {
+                    &empty_blocked_thread_ids
+                };
+                match reconcile_all_stores_with_known_blocked(
                     codex_home,
                     provider_override.as_deref(),
                     profile_override.as_deref(),
-                    periodic_watch_rollout_scope(rollout_scope, poll_count),
+                    periodic_scope,
                     Duration::ZERO,
                     store_filter,
                     None,
+                    blocked_thread_ids,
                 ) {
                     Ok(summary) => {
-                        if watch_should_print_summary(last_provider.as_deref(), &summary) {
+                        if watch_should_print_summary(
+                            last_provider.as_deref(),
+                            &known_blocked_thread_ids,
+                            &summary,
+                        ) {
                             print_multi_sync_summary(
                                 locale,
                                 background_reconcile_title(locale),
@@ -166,6 +186,7 @@ pub(crate) fn run_watch(
                             );
                         }
                         last_provider = Some(summary.provider.clone());
+                        known_blocked_thread_ids = summary.blocked_thread_ids.clone();
                     }
                     Err(err) => {
                         eprintln!("{}", watch_reconcile_skipped_message(locale, &err));
@@ -184,12 +205,18 @@ pub(crate) fn run_watch(
 
 pub(crate) fn watch_should_print_summary(
     last_provider: Option<&str>,
+    known_blocked_thread_ids: &HashSet<String>,
     summary: &MultiReconcileSummary,
 ) -> bool {
-    summary.status() != ReconcileStatus::Full
+    let store_not_updated = summary
+        .stores
+        .iter()
+        .any(|store| !matches!(store.outcome, crate::sync::StoreOutcome::Updated { .. }));
+    store_not_updated
         || last_provider != Some(summary.provider.as_str())
         || summary.total_changed_rows() > 0
         || summary.changed_rollouts > 0
+        || known_blocked_thread_ids != &summary.blocked_thread_ids
 }
 
 pub(crate) fn periodic_watch_rollout_scope(
