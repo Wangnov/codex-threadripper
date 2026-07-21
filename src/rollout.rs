@@ -55,6 +55,10 @@ pub(crate) struct RolloutReconcileSummary {
     pub(crate) changed_files: u64,
     pub(crate) prepared_files: u64,
     pub(crate) skipped_files: u64,
+    /// Thread IDs whose paginated rollouts require a length-changing rewrite.
+    /// Callers must leave the matching SQLite rows untouched so the rollout and
+    /// provider index cannot diverge while Codex owns byte-offset checkpoints.
+    pub(crate) blocked_thread_ids: HashSet<String>,
     pub(crate) journal_path: Option<PathBuf>,
 }
 
@@ -154,6 +158,7 @@ struct RolloutPatchOutcome {
     changed: bool,
     prepared: bool,
     skipped: bool,
+    block_sqlite: bool,
 }
 
 struct RolloutChangeJournal {
@@ -333,6 +338,9 @@ fn reconcile_rollout_metadata_files(
         if outcome.skipped {
             summary.skipped_files += 1;
         }
+        if outcome.block_sqlite {
+            summary.blocked_thread_ids.insert(target.thread_id.clone());
+        }
         if let Some(progress) = progress.as_mut() {
             progress.tick(&summary);
         }
@@ -365,6 +373,7 @@ fn rewrite_rollout_provider_first_line(
         });
     };
     let old_provider = session_meta_provider(&value).unwrap_or("").to_string();
+    let paginated_history = session_meta_history_is_paginated(&value);
 
     if !set_session_meta_provider(&mut value, provider) {
         return Ok(RolloutPatchOutcome::default());
@@ -392,6 +401,19 @@ fn rewrite_rollout_provider_first_line(
         )?;
         return Ok(RolloutPatchOutcome {
             changed: true,
+            ..RolloutPatchOutcome::default()
+        });
+    }
+
+    // Codex paginated history persists a byte offset into the rollout. Growing
+    // the first line would shift every later record while leaving that
+    // checkpoint stale. An in-place replacement above is safe because it keeps
+    // the exact byte length; a growing rewrite must be left untouched, along
+    // with the matching SQLite provider row.
+    if paginated_history {
+        return Ok(RolloutPatchOutcome {
+            skipped: true,
+            block_sqlite: true,
             ..RolloutPatchOutcome::default()
         });
     }
@@ -775,6 +797,14 @@ fn session_meta_provider(value: &Value) -> Option<&str> {
         .get("payload")
         .and_then(|payload| payload.get("model_provider"))
         .and_then(Value::as_str)
+}
+
+fn session_meta_history_is_paginated(value: &Value) -> bool {
+    value
+        .get("payload")
+        .and_then(|payload| payload.get("history_mode"))
+        .and_then(Value::as_str)
+        == Some("paginated")
 }
 
 fn set_session_meta_provider(value: &mut Value, provider: &str) -> bool {

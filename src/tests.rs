@@ -1541,7 +1541,7 @@ fn durable_sync_patches_shorter_provider_in_place() -> Result<()> {
     fs::write(
         &rollout_path,
         concat!(
-            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"openai\"}}      \n",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"openai\",\"history_mode\":\"paginated\"}}      \n",
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
         ),
     )?;
@@ -1679,6 +1679,80 @@ fn durable_sync_rewrites_cold_longer_provider_with_padding() -> Result<()> {
     );
     assert!(rewritten.contains("\"message\":\"hi\""));
     assert!(journal.contains("\"mode\":\"rewrite\""));
+    Ok(())
+}
+
+#[test]
+fn paginated_growth_blocks_only_matching_rollout_and_sqlite_row() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let codex_home = dir.path();
+    isolate_process_sqlite_home(codex_home)?;
+    let sqlite_path = codex_home.join("state_5.sqlite");
+    let rollout_path = codex_home.join("sessions/2026/07/21/rollout-paginated.jsonl");
+    let legacy_rollout_path = codex_home.join("sessions/2026/07/21/rollout-legacy.jsonl");
+    fs::create_dir_all(rollout_path.parent().unwrap())?;
+    fs::write(
+        &rollout_path,
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"1\",\"model_provider\":\"vm\",\"history_mode\":\"paginated\"}}\n",
+            "{\"timestamp\":\"2026-07-21T00:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"},\"ordinal\":0}\n",
+        ),
+    )?;
+    fs::write(
+        &legacy_rollout_path,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"2\",\"model_provider\":\"vm\",\"history_mode\":\"legacy\"}}        \n",
+    )?;
+    let original = fs::read(&rollout_path)?;
+    let original_mtime = FileTime::from_unix_time(1_700_000_300, 0);
+    set_file_times(&rollout_path, original_mtime, original_mtime)?;
+
+    seed_sqlite(&sqlite_path)?;
+    let connection = Connection::open(&sqlite_path)?;
+    connection.execute(
+        "UPDATE threads SET model_provider = 'openai', rollout_path = ''",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE threads SET rollout_path = ?1, model_provider = 'vm' WHERE id = '1'",
+        [rollout_path.display().to_string()],
+    )?;
+    connection.execute(
+        "UPDATE threads SET rollout_path = ?1, model_provider = 'vm' WHERE id = '2'",
+        [legacy_rollout_path.display().to_string()],
+    )?;
+    drop(connection);
+
+    let summary = reconcile_all_stores(
+        codex_home,
+        Some("openai"),
+        None,
+        RolloutScope::AllRows,
+        Duration::ZERO,
+        StoreFilter::All,
+        None,
+    )?;
+
+    assert_eq!(summary.status(), ReconcileStatus::Partial);
+    assert_eq!(summary.changed_rollouts, 1);
+    assert_eq!(summary.skipped_rollouts, 1);
+    assert_eq!(summary.blocked_rollouts, 1);
+    assert_eq!(summary.total_changed_rows(), 1);
+    assert_eq!(fs::read(&rollout_path)?, original);
+    assert_rollout_times(&rollout_path, original_mtime)?;
+    let connection = Connection::open(&sqlite_path)?;
+    let blocked_provider: String = connection.query_row(
+        "SELECT model_provider FROM threads WHERE id = '1'",
+        [],
+        |row| row.get(0),
+    )?;
+    let updated_provider: String = connection.query_row(
+        "SELECT model_provider FROM threads WHERE id = '2'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(blocked_provider, "vm");
+    assert_eq!(updated_provider, "openai");
+    assert!(fs::read_to_string(&legacy_rollout_path)?.contains("\"model_provider\":\"openai\""));
     Ok(())
 }
 
@@ -1856,6 +1930,7 @@ fn watch_prints_non_full_summary_even_when_counts_are_unchanged() {
         checked_rollouts: 0,
         prepared_rollouts: 0,
         skipped_rollouts: 0,
+        blocked_rollouts: 0,
         rollout_journal_path: None,
         elapsed: Duration::ZERO,
     };

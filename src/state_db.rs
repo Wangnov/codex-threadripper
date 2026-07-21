@@ -6,6 +6,9 @@ use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 use rusqlite::backup::Backup;
 use rusqlite::backup::StepResult;
+use rusqlite::params_from_iter;
+use rusqlite::types::Value;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -88,7 +91,16 @@ pub(crate) fn read_backfill_status_with_timeout(
     Ok(status)
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> Result<(u64, u64)> {
+    reconcile_sqlite_in_place_excluding(sqlite_path, provider, &HashSet::new())
+}
+
+pub(crate) fn reconcile_sqlite_in_place_excluding(
+    sqlite_path: &Path,
+    provider: &str,
+    excluded_thread_ids: &HashSet<String>,
+) -> Result<(u64, u64)> {
     ensure_sqlite_exists(sqlite_path)?;
     let mut connection = Connection::open(sqlite_path)
         .with_context(|| format!("failed to open {}", sqlite_path.display()))?;
@@ -96,10 +108,30 @@ pub(crate) fn reconcile_sqlite_in_place(sqlite_path: &Path, provider: &str) -> R
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let total_rows: u64 =
         transaction.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
-    let changed_rows = transaction.execute(
-        "UPDATE threads SET model_provider = ?1 WHERE model_provider <> ?1",
-        [provider],
-    )? as u64;
+    let changed_rows = if excluded_thread_ids.is_empty() {
+        transaction.execute(
+            "UPDATE threads SET model_provider = ?1 WHERE model_provider <> ?1",
+            [provider],
+        )? as u64
+    } else {
+        let mut excluded_thread_ids = excluded_thread_ids.iter().collect::<Vec<_>>();
+        excluded_thread_ids.sort_unstable();
+        let placeholders = std::iter::repeat_n("?", excluded_thread_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE threads SET model_provider = ? WHERE model_provider <> ? AND id NOT IN ({placeholders})"
+        );
+        let mut values = Vec::with_capacity(excluded_thread_ids.len() + 2);
+        values.push(Value::Text(provider.to_string()));
+        values.push(Value::Text(provider.to_string()));
+        values.extend(
+            excluded_thread_ids
+                .into_iter()
+                .map(|thread_id| Value::Text(thread_id.clone())),
+        );
+        transaction.execute(sql.as_str(), params_from_iter(values.iter()))? as u64
+    };
     transaction.commit()?;
 
     Ok((changed_rows, total_rows))

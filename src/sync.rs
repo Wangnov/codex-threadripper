@@ -23,7 +23,7 @@ use crate::state_db::create_sqlite_backup_file_in;
 use crate::state_db::inspect_sqlite_distribution;
 use crate::state_db::read_backfill_status;
 use crate::state_db::read_backfill_status_with_timeout;
-use crate::state_db::reconcile_sqlite_in_place;
+use crate::state_db::reconcile_sqlite_in_place_excluding;
 use crate::state_db::unix_timestamp_millis;
 use crate::stores::StoreFilter;
 use crate::stores::StoreKind;
@@ -175,6 +175,7 @@ pub(crate) struct MultiReconcileSummary {
     pub(crate) checked_rollouts: u64,
     pub(crate) prepared_rollouts: u64,
     pub(crate) skipped_rollouts: u64,
+    pub(crate) blocked_rollouts: u64,
     pub(crate) rollout_journal_path: Option<PathBuf>,
     pub(crate) elapsed: Duration,
 }
@@ -186,10 +187,10 @@ impl MultiReconcileSummary {
             .iter()
             .filter(|store| matches!(store.outcome, StoreOutcome::Updated { .. }))
             .count();
-        if updated == self.stores.len() {
-            ReconcileStatus::Full
-        } else if updated == 0 {
+        if updated == 0 {
             ReconcileStatus::Failed
+        } else if updated == self.stores.len() && self.blocked_rollouts == 0 {
+            ReconcileStatus::Full
         } else {
             ReconcileStatus::Partial
         }
@@ -406,6 +407,7 @@ fn reconcile_stores_core(
             checked_rollouts: 0,
             prepared_rollouts: 0,
             skipped_rollouts: 0,
+            blocked_rollouts: 0,
             rollout_journal_path: None,
             elapsed: started.elapsed(),
         });
@@ -463,6 +465,7 @@ fn reconcile_stores_core(
             checked_rollouts: 0,
             prepared_rollouts: 0,
             skipped_rollouts: 0,
+            blocked_rollouts: 0,
             rollout_journal_path: None,
             elapsed: started.elapsed(),
         });
@@ -540,7 +543,12 @@ fn reconcile_stores_core(
                 } else {
                     None
                 };
-                reconcile_single_store(target, provider.as_str(), backup_path)
+                reconcile_single_store(
+                    target,
+                    provider.as_str(),
+                    backup_path,
+                    &rollout_summary.blocked_thread_ids,
+                )
             }
         })
         .collect();
@@ -576,6 +584,9 @@ fn reconcile_stores_core(
         rollout_summary.changed_files += followup.summary.changed_files;
         rollout_summary.prepared_files += followup.summary.prepared_files;
         rollout_summary.skipped_files += followup.summary.skipped_files;
+        rollout_summary
+            .blocked_thread_ids
+            .extend(followup.summary.blocked_thread_ids);
     }
 
     Ok(MultiReconcileSummary {
@@ -585,6 +596,7 @@ fn reconcile_stores_core(
         checked_rollouts: rollout_summary.checked_files,
         prepared_rollouts: rollout_summary.prepared_files,
         skipped_rollouts: rollout_summary.skipped_files,
+        blocked_rollouts: rollout_summary.blocked_thread_ids.len() as u64,
         rollout_journal_path: rollout_summary.journal_path,
         elapsed: started.elapsed(),
     })
@@ -615,17 +627,19 @@ fn reconcile_single_store(
     target: &StoreTarget,
     provider: &str,
     backup_path: Option<PathBuf>,
+    excluded_thread_ids: &HashSet<String>,
 ) -> StoreReconcileResult {
-    let outcome = match reconcile_single_store_inner(target, provider, backup_path) {
-        Ok((changed_rows, total_rows, backup_path)) => StoreOutcome::Updated {
-            changed_rows,
-            total_rows,
-            backup_path,
-        },
-        Err(error) => StoreOutcome::Failed {
-            error: error.to_string(),
-        },
-    };
+    let outcome =
+        match reconcile_single_store_inner(target, provider, backup_path, excluded_thread_ids) {
+            Ok((changed_rows, total_rows, backup_path)) => StoreOutcome::Updated {
+                changed_rows,
+                total_rows,
+                backup_path,
+            },
+            Err(error) => StoreOutcome::Failed {
+                error: error.to_string(),
+            },
+        };
     StoreReconcileResult {
         kind: target.kind,
         db_path: target.db_path.clone(),
@@ -637,7 +651,9 @@ fn reconcile_single_store_inner(
     target: &StoreTarget,
     provider: &str,
     backup_path: Option<PathBuf>,
+    excluded_thread_ids: &HashSet<String>,
 ) -> Result<(u64, u64, Option<PathBuf>)> {
-    let (changed_rows, total_rows) = reconcile_sqlite_in_place(&target.db_path, provider)?;
+    let (changed_rows, total_rows) =
+        reconcile_sqlite_in_place_excluding(&target.db_path, provider, excluded_thread_ids)?;
     Ok((changed_rows, total_rows, backup_path))
 }
